@@ -1,161 +1,224 @@
-import os, json
+import argparse
+import socket
+import json
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.distributions import Categorical
 import numpy as np
 
-from ac_model import ActorCritic  # 그대로 사용
-from multiagent_env_5v5 import CombatSelfPlay5v5Env  # 그대로 사용
+from multiagent_env_5v5 import CombatSelfPlay5v5Env
+from ac_model import TeamPolicy, UnitActorCritic
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ===== 환경 & 모델 파라미터 =====
-env = CombatSelfPlay5v5Env(width=12, height=8, n_per_team=5, max_steps=120, hp=3, reload_steps=5, seed=42)
-state_dim = env._obs_team(env.A, env.B).shape[0]  # 중앙집중 관측(양 팀 정보 모두)
-action_dim_per_agent = 10  # 0..9
-n_agents = env.n
+def make_env(width, height, n_per_team, max_steps, hp, reload_steps, seed):
+    return CombatSelfPlay5v5Env(
+        width=width, height=height, n_per_team=n_per_team,
+        max_steps=max_steps, hp=hp, reload_steps=reload_steps, seed=seed
+    )
 
-# 팀당 하나의 중앙정책(공유) -> 각 에이전트에 대해 독립적으로 10-way action을 n_agents개 샘플
-model_A = ActorCritic(state_dim, action_dim_per_agent).to(device)
-model_B = ActorCritic(state_dim, action_dim_per_agent).to(device)
+def obs_dim_for_env(env):
+    return env._obs_team(env.A, env.B).shape[0]
 
-opt_A = optim.Adam(model_A.parameters(), lr=1e-3)
-opt_B = optim.Adam(model_B.parameters(), lr=1e-3)
+class UdpStreamer:
+    def __init__(self, port: int | None):
+        self.port = port
+        self.sock = None
+        self.addr = ("127.0.0.1", port) if port else None
+        if port:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-gamma = 0.99
-episodes = 10000          # ★ 500 -> 10000
-entropy_coef = 0.01
-grad_clip = 1.0           # ★ 그래디언트 클리핑
-save_every = 1000         # ★ 체크포인트 저장 주기
-replay_dir = "replays"    # ★ 리플레이 저장 폴더
-ckpt_dir = "checkpoints"  # ★ 체크포인트 저장 폴더
-os.makedirs(replay_dir, exist_ok=True)
-os.makedirs(ckpt_dir, exist_ok=True)
+    def send_env(self, env, info):
+        if not self.sock: return
+        payload = {
+            "t": env.t,
+            "width": env.width,
+            "height": env.height,
+            "baseA": info.get("base_A"),
+            "baseB": info.get("base_B"),
+            "A": env.A.tolist(),
+            "B": env.B.tolist(),
+            "shots": info.get("shots", []),
+            "outcome": info.get("outcome"),
+        }
+        self.sock.sendto(json.dumps(payload).encode("utf-8"), self.addr)
 
-def select_actions(model, obs_np, n_agents):
-    x = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
-    logits, value = model(x)                              # (1, action_dim), (1,1)
-    probs = F.softmax(logits, dim=-1).squeeze(0)          # (action_dim,)
-    dist = torch.distributions.Categorical(probs)
-    # n_agents개 샘플
-    actions = dist.sample((n_agents,))                    # (n_agents,)
-    logps = dist.log_prob(actions)                        # (n_agents,)
-    ent = dist.entropy()                                  # scalar
-    return actions.cpu().numpy().astype(np.int32), logps, value.squeeze(0), ent
+def rollout(env, teamA, unitA, teamB, unitB, num_tactics, T, streamer: UdpStreamer, gamma=0.99):
+    obsA, obsB = env.reset()
+    obsA = torch.from_numpy(obsA).float().to(device)
+    obsB = torch.from_numpy(obsB).float().to(device)
 
-for ep in range(episodes):
-    obs_A, obs_B = env.reset()
-    obs_A = obs_A.astype(np.float32)
-    obs_B = obs_B.astype(np.float32)
+    stor = dict(
+        obsA=[], obsB=[], zA=[], zB=[], aA=[], aB=[],
+        logpA=[], logpB=[], vA_team=[], vB_team=[], vA_unit=[], vB_unit=[],
+        rA=[], rB=[], done=[], outcome=[]
+    )
 
-    done = False
-    logps_A, vals_A, rews_A, ents_A = [], [], [], []
-    logps_B, vals_B, rews_B, ents_B = [], [], [], []
+    ep_ret_A = 0.0
+    ep_ret_B = 0.0
+    ep_cnt = 0
+    outcome_hist = {"A_capture":0, "B_capture":0, "A_wipe":0, "B_wipe":0, "timeout":0, None:0}
 
-    # ★ 리플레이(스텝별 상태 저장)
-    traj = []
+    for t in range(T):
+        # team tactics
+        logitsA, vA_t = teamA(obsA.unsqueeze(0))
+        logitsB, vB_t = teamB(obsB.unsqueeze(0))
+        distA = Categorical(logits=logitsA.squeeze(0))
+        distB = Categorical(logits=logitsB.squeeze(0))
+        zA = distA.sample()
+        zB = distB.sample()
+        zA_oh = F.one_hot(zA, num_classes=num_tactics).float().to(device)
+        zB_oh = F.one_hot(zB, num_classes=num_tactics).float().to(device)
 
-    # ★ 스텝 로그: ep 0,1은 항상 / 그 이후는 100에피소드마다
-    want_step_log = (ep < 2) or (ep % 100 == 0)
+        # unit actions (shared policy, n independent samples)
+        logits_uA, vA_u = unitA(obsA.unsqueeze(0), zA_oh.unsqueeze(0))
+        logits_uB, vB_u = unitB(obsB.unsqueeze(0), zB_oh.unsqueeze(0))
+        piA = Categorical(logits=logits_uA.squeeze(0))
+        piB = Categorical(logits=logits_uB.squeeze(0))
 
-    step_idx = 0
-    while not done:
-        acts_A, logp_A, val_A, ent_A = select_actions(model_A, obs_A, n_agents)
-        acts_B, logp_B, val_B, ent_B = select_actions(model_B, obs_B, n_agents)
+        n = env.n
+        aA = piA.sample((n,))
+        aB = piB.sample((n,))
 
-        next_A, next_B, rA, rB, done, info = env.step(acts_A, acts_B)
-        next_A = next_A.astype(np.float32)
-        next_B = next_B.astype(np.float32)
+        next_obsA, next_obsB, rA, rB, done, info = env.step(aA.cpu().numpy(), aB.cpu().numpy())
 
-        if want_step_log:
-            print(f"[ep {ep} step {step_idx}] rA={rA:.2f} rB={rB:.2f}  "
-                  f"A_alive={int((env.A[:,2]>0).sum())}  B_alive={int((env.B[:,2]>0).sum())}")
+        # stream to Unity (optional)
+        if streamer: streamer.send_env(env, info)
 
-        # 팀 단위 학습 값 저장
-        logps_A.append(logp_A.sum())
-        vals_A.append(val_A)
-        rews_A.append(torch.tensor(rA, dtype=torch.float32, device=device))
-        ents_A.append(ent_A)
+        stor['obsA'].append(obsA); stor['obsB'].append(obsB)
+        stor['zA'].append(zA); stor['zB'].append(zB)
+        stor['aA'].append(aA); stor['aB'].append(aB)
+        stor['logpA'].append(distA.log_prob(zA) + piA.log_prob(aA).sum())
+        stor['logpB'].append(distB.log_prob(zB) + piB.log_prob(aB).sum())
+        stor['vA_team'].append(vA_t.squeeze(0)); stor['vB_team'].append(vB_t.squeeze(0))
+        stor['vA_unit'].append(vA_u.squeeze(0)); stor['vB_unit'].append(vB_u.squeeze(0))
+        stor['rA'].append(torch.tensor(rA, dtype=torch.float32, device=device))
+        stor['rB'].append(torch.tensor(rB, dtype=torch.float32, device=device))
+        stor['done'].append(torch.tensor(done, dtype=torch.float32, device=device))
+        stor['outcome'].append(info.get("outcome"))
 
-        logps_B.append(logp_B.sum())
-        vals_B.append(val_B)
-        rews_B.append(torch.tensor(rB, dtype=torch.float32, device=device))
-        ents_B.append(ent_B)
+        ep_ret_A += rA
+        ep_ret_B += rB
 
-        # ★ 리플레이 기록 (현재 상태를 기록)
-        traj.append({
-            "t": step_idx,
-            "A": env.A.tolist(),  # [[x,y,hp,fx,fy,cd]*5]
-            "B": env.B.tolist(),  # [[x,y,hp,fx,fy,cd]*5]
-            "acts_A": acts_A.tolist(),
-            "acts_B": acts_B.tolist(),
-            "rA": float(rA),
-            "rB": float(rB)
-        })
+        obsA = torch.from_numpy(next_obsA).float().to(device)
+        obsB = torch.from_numpy(next_obsB).float().to(device)
 
-        obs_A, obs_B = next_A, next_B
-        step_idx += 1
+        if done:
+            ep_cnt += 1
+            outcome_hist[info.get("outcome")] = outcome_hist.get(info.get("outcome"), 0) + 1
+            ep_ret_A = 0.0
+            ep_ret_B = 0.0
+            obsA, obsB = env.reset()
+            obsA = torch.from_numpy(obsA).float().to(device)
+            obsB = torch.from_numpy(obsB).float().to(device)
 
-    # ----- 업데이트 (A) -----
-    returns_A = []
-    G = torch.tensor(0.0, device=device)
-    for r in reversed(rews_A):
-        G = r + gamma * G
-        returns_A.insert(0, G)
-    returns_A = torch.stack(returns_A)
+    # returns/advantages (간단 버전)
+    R_A = 0; R_B = 0
+    advA = []; advB = []
+    retA = []; retB = []
+    for t in reversed(range(T)):
+        R_A = stor['rA'][t] + gamma * R_A * (1 - stor['done'][t])
+        R_B = stor['rB'][t] + gamma * R_B * (1 - stor['done'][t])
+        retA.append(R_A); retB.append(R_B)
 
-    vals_A = torch.stack(vals_A).view(-1)
-    logps_A = torch.stack(logps_A).view(-1)
-    ents_A = torch.stack(ents_A).view(-1)
+        vA = stor['vA_team'][t] + stor['vA_unit'][t]
+        vB = stor['vB_team'][t] + stor['vB_unit'][t]
+        # one-step TD advantage (간결화)
+        deltaA = stor['rA'][t] + gamma * (0 if stor['done'][t] else vA.detach()) - vA.detach()
+        deltaB = stor['rB'][t] + gamma * (0 if stor['done'][t] else vB.detach()) - vB.detach()
+        advA.insert(0, deltaA)
+        advB.insert(0, deltaB)
 
-    adv_A = returns_A - vals_A.detach()
-    policy_loss_A = -(logps_A * adv_A).mean()
-    value_loss_A = 0.5 * F.mse_loss(vals_A, returns_A)
-    entropy_loss_A = ents_A.mean()
+    for k in ['obsA','obsB','zA','zB','aA','aB','logpA','logpB','vA_team','vB_team','vA_unit','vB_unit']:
+        stor[k] = torch.stack(stor[k])
+    stor['retA'] = torch.stack(retA[::-1]); stor['retB'] = torch.stack(retB[::-1])
+    stor['advA'] = torch.stack(advA); stor['advB'] = torch.stack(advB)
+    stor['outcome_hist'] = outcome_hist
+    stor['episodes'] = ep_cnt
+    return stor
 
-    loss_A = policy_loss_A + value_loss_A - entropy_coef * entropy_loss_A
-    opt_A.zero_grad()
-    loss_A.backward()
-    # ★ 그래디언트 클리핑
-    torch.nn.utils.clip_grad_norm_(model_A.parameters(), grad_clip)
-    opt_A.step()
+def train(args):
+    env = make_env(args.width, args.height, args.n_per_team, args.max_steps, args.hp, args.reload_steps, args.seed)
+    obs_dim = obs_dim_for_env(env)
 
-    # ----- 업데이트 (B) -----
-    returns_B = []
-    G = torch.tensor(0.0, device=device)
-    for r in reversed(rews_B):
-        G = r + gamma * G
-        returns_B.insert(0, G)
-    returns_B = torch.stack(returns_B)
+    teamA = TeamPolicy(obs_dim, args.num_tactics).to(device)
+    teamB = TeamPolicy(obs_dim, args.num_tactics).to(device)
+    unitA = UnitActorCritic(obs_dim, args.num_tactics).to(device)
+    unitB = UnitActorCritic(obs_dim, args.num_tactics).to(device)
 
-    vals_B = torch.stack(vals_B).view(-1)
-    logps_B = torch.stack(logps_B).view(-1)
-    ents_B = torch.stack(ents_B).view(-1)
+    opt = optim.Adam(list(teamA.parameters())+list(teamB.parameters())+
+                     list(unitA.parameters())+list(unitB.parameters()), lr=args.lr)
 
-    adv_B = returns_B - vals_B.detach()
-    policy_loss_B = -(logps_B * adv_B).mean()
-    value_loss_B = 0.5 * F.mse_loss(vals_B, returns_B)
-    entropy_loss_B = ents_B.mean()
+    streamer = UdpStreamer(args.stream_udp) if args.stream_udp else None
 
-    loss_B = policy_loss_B + value_loss_B - entropy_coef * entropy_loss_B
-    opt_B.zero_grad()
-    loss_B.backward()
-    # ★ 그래디언트 클리핑
-    torch.nn.utils.clip_grad_norm_(model_B.parameters(), grad_clip)
-    opt_B.step()
+    ema_retA = None
+    ema_retB = None
+    ema_alpha = 0.1
 
-    # ★ 리플레이 저장 (유니티 재생용)
-    with open(os.path.join(replay_dir, f"ep_{ep:05d}.json"), "w", encoding="utf-8") as f:
-        json.dump(traj, f, ensure_ascii=False)
+    for step in range(1, args.steps+1):
+        stor = rollout(env, teamA, unitA, teamB, unitB,
+                       num_tactics=args.num_tactics, T=args.rollout_len,
+                       streamer=streamer)
 
-    # ★ 에피소드 요약 로그: 100에피소드마다
-    if (ep + 1) % 100 == 0:
-        sum_rA = sum(r.item() for r in rews_A)
-        sum_rB = sum(r.item() for r in rews_B)
-        print(f"[summary] ep {ep+1} | A_reward={sum_rA:.2f} | B_reward={sum_rB:.2f}")
+        # policy/value losses
+        logpA = stor['logpA']; logpB = stor['logpB']
+        advA = (stor['advA'] - stor['advA'].mean()) / (stor['advA'].std()+1e-5)
+        advB = (stor['advB'] - stor['advB'].mean()) / (stor['advB'].std()+1e-5)
 
-    # ★ 체크포인트 저장: 1000에피소드마다
-    if (ep + 1) % save_every == 0:
-        torch.save(model_A.state_dict(), os.path.join(ckpt_dir, f"model_A_ep{ep+1}.pt"))
-        torch.save(model_B.state_dict(), os.path.join(ckpt_dir, f"model_B_ep{ep+1}.pt"))
-        print(f"[ckpt] saved at ep {ep+1}")
+        vA = stor['vA_team'] + stor['vA_unit']
+        vB = stor['vB_team'] + stor['vB_unit']
+
+        val_loss = F.mse_loss(vA, stor['retA']) + F.mse_loss(vB, stor['retB'])
+        pi_loss = -(logpA*advA).mean() - (logpB*advB).mean()
+        loss = pi_loss + 0.5*val_loss
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(teamA.parameters())+list(teamB.parameters())+
+                                       list(unitA.parameters())+list(unitB.parameters()), max_norm=1.0)
+        opt.step()
+
+        # 간단한 성능 지표: episode 수/결말 통계
+        ep = max(stor['episodes'], 1)
+        oh = stor['outcome_hist']
+        # outcome 비율
+        captA = oh.get("A_capture", 0); captB = oh.get("B_capture", 0)
+        wipeA = oh.get("A_wipe", 0); wipeB = oh.get("B_wipe", 0)
+        tout  = oh.get("timeout", 0)
+
+        # EMA (여기선 outcome 카운트로 대체)
+        if ema_retA is None:
+            ema_retA = captA - captB + wipeA - wipeB
+            ema_retB = captB - captA + wipeB - wipeA
+        else:
+            ema_retA = (1-ema_alpha)*ema_retA + ema_alpha*(captA - captB + wipeA - wipeB)
+            ema_retB = (1-ema_alpha)*ema_retB + ema_alpha*(captB - captA + wipeB - wipeA)
+
+        if step % args.log_every == 0:
+            print(
+                f"step {step} | loss={loss.item():.3f} | "
+                f"episodes={ep} | "
+                f"A_cap={captA} B_cap={captB} A_wipe={wipeA} B_wipe={wipeB} TO={tout} | "
+                f"EMA(A)={ema_retA:.2f} EMA(B)={ema_retB:.2f}"
+            )
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--rollout_len", type=int, default=64)
+    ap.add_argument("--num_tactics", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    # env
+    ap.add_argument("--width", type=int, default=48)
+    ap.add_argument("--height", type=int, default=48)
+    ap.add_argument("--n_per_team", type=int, default=30)
+    ap.add_argument("--max_steps", type=int, default=240)
+    ap.add_argument("--hp", type=int, default=3)
+    ap.add_argument("--reload_steps", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=42)
+    # streaming
+    ap.add_argument("--stream_udp", type=int, default=0, help="UDP port for Unity viewer (0=off).")
+    ap.add_argument("--log_every", type=int, default=50)
+    args = ap.parse_args()
+    train(args)

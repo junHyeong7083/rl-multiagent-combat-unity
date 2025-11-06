@@ -3,33 +3,47 @@ using UnityEngine;
 public class Bullet : MonoBehaviour
 {
     [Header("Motion")]
-    public float speed = 30f;          // 이동 속도 (units/sec)
-    public float maxLife = 2f;         // 자동 파괴 시간 (초)
-    public bool faceDirection = true;  // 진행 방향으로 회전할지
+    [Min(0.01f)] public float speed = 30f;   // units/sec
+    [Min(0.01f)] public float maxLife = 2f;  // seconds
+    public bool faceDirection = true;
 
     [Header("Hit")]
-    public bool destroyOnArrive = true; // 목표 도달 시 파괴
-    public GameObject hitEffectPrefab;  // 선택: 도착 시 이펙트
+    public bool destroyOnArrive = true;
+    public GameObject hitEffectPrefab;
 
     [Header("Trail (optional)")]
-    public TrailRenderer trail;        // 선택: 트레일 지정 시 파괴 타이밍에 잔상 자연 삭제
+    public TrailRenderer trail;
 
     [HideInInspector] public Vector3 target;
 
     float life;
+    bool fired;
 
-    /// <summary>
-    /// 코드에서 스폰 직후 호출해서 목표를 세팅하고 즉시 발사.
-    /// </summary>
+    /// <summary>스폰 직후 목표 세팅 + 발사</summary>
     public void FireTo(Vector3 worldTarget)
     {
         target = worldTarget;
+        fired = true;
+
         if (faceDirection)
         {
             Vector3 dir = (target - transform.position);
-            if (dir.sqrMagnitude > 1e-6f)
+            if (dir.sqrMagnitude > 1e-8f)
                 transform.rotation = Quaternion.LookRotation(dir.normalized, Vector3.up);
         }
+    }
+
+    /// <summary>런타임으로 속도/수명 보정할 때 사용</summary>
+    public void SetMotion(float newSpeed, float newMaxLife)
+    {
+        if (newSpeed > 0f) speed = newSpeed;
+        if (newMaxLife > 0f) maxLife = newMaxLife;
+    }
+
+    void OnEnable()
+    {
+        life = 0f;
+        fired = false;
     }
 
     void Update()
@@ -40,18 +54,23 @@ public class Bullet : MonoBehaviour
             DestroySelf();
             return;
         }
+        if (!fired) return;
 
         // 타겟으로 직선 이동
-        Vector3 dir = target - transform.position;
-        float dist = dir.magnitude;
+        Vector3 to = target - transform.position;
+        float sqr = to.sqrMagnitude;
 
-        if (dist <= Mathf.Epsilon)
+        if (sqr <= 1e-10f)
         {
+            // 거의 도달한 상태면 즉시 처리
+            transform.position = target;
             Arrive();
             return;
         }
 
+        float dist = Mathf.Sqrt(sqr);
         float step = speed * Time.deltaTime;
+
         if (step >= dist)
         {
             transform.position = target;
@@ -59,17 +78,17 @@ public class Bullet : MonoBehaviour
         }
         else
         {
-            Vector3 move = dir / dist * step;
+            Vector3 move = to * (step / dist);
             transform.position += move;
 
-            if (faceDirection && move.sqrMagnitude > 1e-10f)
+            if (faceDirection && move.sqrMagnitude > 1e-14f)
                 transform.rotation = Quaternion.LookRotation(move.normalized, Vector3.up);
         }
     }
 
     void Arrive()
     {
-        if (hitEffectPrefab != null)
+        if (hitEffectPrefab)
         {
             var fx = Instantiate(hitEffectPrefab, target, Quaternion.identity);
             Destroy(fx, 1.5f);
@@ -79,13 +98,17 @@ public class Bullet : MonoBehaviour
 
     void DestroySelf()
     {
-        // 트레일이 달려있으면 잔상 자연 소멸을 위해 분리 후 일정 시간 뒤 파괴
-        if (trail != null)
+        // 트레일 잔상 자연 소멸
+        if (trail)
         {
-            // 트레일을 분리해서 잔상 유지
-            trail.transform.parent = null;
-            // 잔상 길이만큼 기다렸다가 파괴
-            Destroy(trail.gameObject, trail.time + 0.1f);
+            try
+            {
+                trail.transform.SetParent(null, true);
+                // TrailRenderer가 비활성화될 수 있으니 먼저 켜두기
+                if (!trail.gameObject.activeSelf) trail.gameObject.SetActive(true);
+                Destroy(trail.gameObject, trail.time + 0.1f);
+            }
+            catch { /* ignored */ }
         }
         Destroy(gameObject);
     }
