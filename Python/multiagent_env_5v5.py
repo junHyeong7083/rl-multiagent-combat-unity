@@ -1,183 +1,366 @@
 import numpy as np
 
+
 class CombatSelfPlay5v5Env:
+    """
+    격자형 5v5 자가대전 환경.
+    - 이동: 8방향 + 정지 = 9개
+    - 공격: 1개 (총 10개 액션)
+    - 즉발 판정이지만 사거리/산개/명중률 반영
+    - 재장전 쿨다운은 유닛별로 랜덤 부여
+    - 장애물/시야차단(LOS) 옵션 포함
+    관측:
+      팀 관측(team_obs): A와 B의 유닛 상태를 모두 평탄화한 벡터
+      유닛 관측(unit_obs): 팀 관측 + 선택적 로컬 파생치(여기서는 팀 관측 그대로 사용)
+    """
     ACT_STAY = 0
-    ACT_MOVE_DIRS = {
-        1: (0, -1), 2: (0,  1), 3: (-1, 0), 4: (1,  0),
-        5: (-1,-1), 6: (1, -1), 7: (-1, 1), 8: (1,  1),
-    }
+    ACT_N  = 1
+    ACT_NE = 2
+    ACT_E  = 3
+    ACT_SE = 4
+    ACT_S  = 5
+    ACT_SW = 6
+    ACT_W  = 7
+    ACT_NW = 8
     ACT_ATTACK = 9
 
+    ACT_MOVE_DIRS = {
+        ACT_N:  (0, 1),
+        ACT_NE: (1, 1),
+        ACT_E:  (1, 0),
+        ACT_SE: (1, -1),
+        ACT_S:  (0, -1),
+        ACT_SW: (-1, -1),
+        ACT_W:  (-1, 0),
+        ACT_NW: (-1, 1),
+    }
+
     def __init__(self, width=32, height=32, n_per_team=5, max_steps=180,
-                 hp=3, reload_steps=5, seed=None):
-        self.width = int(width)
-        self.height = int(height)
-        self.n = int(n_per_team)
-        self.max_steps = int(max_steps)
-        self.hp_max = int(hp)
-        self.reload_steps = int(reload_steps)
-        self.rng = np.random.RandomState(seed)
-        self.A = None
-        self.B = None
+                 seed=0, use_obstacles=True, obstacle_rate=0.06):
+        self.width = width
+        self.height = height
+        self.n = n_per_team
+        self.max_steps = max_steps
+        self.use_obstacles = use_obstacles
+        self.obstacle_rate = obstacle_rate
+
+        self.rng = np.random.default_rng(seed)
         self.t = 0
-        self.base_A = (1, self.height-2)   # ~7시 (SW)
-        self.base_B = (self.width-2, 1)    # ~1시 (NE)
-        self._init_state()
 
-    def _spawn_cluster(self, base, count, radius=2):
-        bx, by = base
-        pts = []
-        tries = 0
-        while len(pts) < count and tries < count*20:
-            tries += 1
-            dx = self.rng.randint(-radius, radius+1)
-            dy = self.rng.randint(-radius, radius+1)
-            x = np.clip(bx+dx, 1, self.width-2)
-            y = np.clip(by+dy, 1, self.height-2)
-            if (x,y) not in pts:
-                pts.append((x,y))
-        while len(pts) < count:
-            x = self.rng.randint(1, self.width-1)
-            y = self.rng.randint(1, self.height-1)
-            if (x,y) not in pts:
-                pts.append((x,y))
-        return pts
+        # [x, y, hp, fx, fy, cd, base_cd]
+        self.A = np.zeros((self.n, 7), dtype=np.int32)
+        self.B = np.zeros((self.n, 7), dtype=np.int32)
 
-    def _init_state(self):
-        self.t = 0
-        # agents columns: x,y,hp, fx,fy, cooldown
-        self.A = np.zeros((self.n, 6), dtype=np.int32)
-        self.B = np.zeros((self.n, 6), dtype=np.int32)
-        a_pts = self._spawn_cluster(self.base_A, self.n)
-        b_pts = self._spawn_cluster(self.base_B, self.n)
-        for i,(x,y) in enumerate(a_pts):
-            self.A[i,:] = (x,y,self.hp_max, 1,0, 0)
-        for i,(x,y) in enumerate(b_pts):
-            self.B[i,:] = (x,y,self.hp_max, -1,0, 0)
+        # 전장
+        self.blocks = np.zeros((self.width, self.height), dtype=np.int8)
 
-    def reset(self, seed=None):
-        if seed is not None:
-            self.rng = np.random.RandomState(seed)
-        self._init_state()
-        return (self._obs_team(self.A, self.B),
-                self._obs_team(self.B, self.A))
+        # 파라미터
+        self.hp_init = 5
+        self.min_range = 1
+        self.max_range = 6
+        self.base_cooldown = 3  # 유닛별 기본 쿨다운에 더해짐
+        self.hit_prob = 0.55
+        self.flank_bonus = 0.15  # 측면/후방 보정
 
-    def _alive_mask(self, arr):
-        return arr[:,2] > 0
+        self.reset()
 
-    def _in_bounds(self, x,y):
+    # ---------------- Utils ----------------
+
+    def _in_bounds(self, x, y):
         return 0 <= x < self.width and 0 <= y < self.height
 
-    def _move_one(self, agent, dir_id, occ):  # occ: occupancy set to avoid overlap
-        if agent[2] <= 0: return
-        if dir_id == self.ACT_STAY: return
-        dx,dy = self.ACT_MOVE_DIRS[dir_id]
-        nx,ny = agent[0]+dx, agent[1]+dy
-        if not self._in_bounds(nx,ny): return
-        if (nx,ny) in occ: return
-        agent[0]=nx; agent[1]=ny; agent[3]=np.sign(dx) if dx!=0 else 0; agent[4]=np.sign(dy) if dy!=0 else 0
+    def _blocked(self, x, y):
+        return self.blocks[x, y] == 1
 
-    def _line_hit(self, shooter, enemies):
-        sx, sy, _, fx, fy, _ = shooter
-        if fx==0 and fy==0: return -1, None
-        fx = 0 if fx==0 else (1 if fx>0 else -1)
-        fy = 0 if fy==0 else (1 if fy>0 else -1)
-        best = None
-        best_d = 10**9
-        for idx,(ex,ey,ehp, *_rest) in enumerate(enemies):
-            if ehp<=0: continue
-            dx = ex - sx; dy = ey - sy
-            # inline check
-            if fx==0 and dy*np.sign(fy)>=0 and dx==0 and (fy!=0):
-                d = abs(dy)
-            elif fy==0 and dx*np.sign(fx)>=0 and dy==0 and (fx!=0):
-                d = abs(dx)
-            elif abs(dx)==abs(dy) and (np.sign(dx)==fx) and (np.sign(dy)==fy):
-                d = abs(dx)
-            else:
+    def _bresenham_clear(self, x0, y0, x1, y1):
+        # x0,y0 → x1,y1 사이에 장애물 있는지 (끝점 제외)
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        x, y = x0, y0
+        while True:
+            if (x, y) != (x0, y0) and (x, y) != (x1, y1):
+                if self._blocked(x, y):
+                    return False
+            if (x, y) == (x1, y1):
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+        return True
+
+    def _distance(self, x0, y0, x1, y1):
+        return max(abs(x1 - x0), abs(y1 - y0))
+
+    # ---------------- Reset ----------------
+
+    def reset(self):
+        self.t = 0
+
+        # 전장 리셋
+        self.blocks[:] = 0
+        if self.use_obstacles:
+            mask = self.rng.random((self.width, self.height)) < self.obstacle_rate
+            self.blocks[mask] = 1
+
+        def spawn_team(left_side=True):
+            team = np.zeros((self.n, 7), dtype=np.int32)
+            for i in range(self.n):
+                if left_side:
+                    x = self.rng.integers(1, self.width // 3)
+                else:
+                    x = self.rng.integers(self.width - self.width // 3, self.width - 1)
+                y = self.rng.integers(1, self.height - 1)
+                team[i, 0] = x
+                team[i, 1] = y
+                team[i, 2] = self.hp_init
+                # 초기 바라보는 방향: 중앙 쪽
+                team[i, 3] = 1 if left_side else -1
+                team[i, 4] = 0
+                # 쿨다운
+                base_cd = self.base_cooldown + int(self.rng.integers(0, 3))
+                team[i, 5] = 0
+                team[i, 6] = base_cd
+            return team
+
+        self.A = spawn_team(left_side=True)
+        self.B = spawn_team(left_side=False)
+
+        return self._obs_team(self.A, self.B), self._obs_team(self.B, self.A)
+
+    # ---------------- Attack core ----------------
+
+    def _attack_targets(self, me, other):
+        # 각 유닛이 조준 방향으로 공격할 때 맞을 수 있는 타겟을 찾고 명중 확률/산개를 적용
+        hits = []
+        for i in range(self.n):
+            x, y, hp, fx, fy, cd, base_cd = me[i]
+            if hp <= 0 or cd > 0:
                 continue
-            if d < best_d:
-                best_d = d
-                best = idx
-        if best is None:
-            # for viz endpoint ray
-            end = (np.clip(sx+fx*max(self.width,self.height),0,self.width-1),
-                   np.clip(sy+fy*max(self.width,self.height),0,self.height-1))
-            return -1, end
-        return best, (enemies[best,0], enemies[best,1])
-
-    def step(self, actA, actB):
-        self.t += 1
-        shots = []
-        # movement occupancy
-        occA = {(x,y) for (x,y,hp,fx,fy,cd) in self.A if hp>0}
-        occB = {(x,y) for (x,y,hp,fx,fy,cd) in self.B if hp>0}
-        # move
-        for i,a in enumerate(self.A):
-            if a[2]<=0: continue
-            if actA[i] in self.ACT_MOVE_DIRS:
-                occA.remove((a[0],a[1]))
-                self._move_one(a, actA[i], occA)
-                occA.add((a[0],a[1]))
-        for i,b in enumerate(self.B):
-            if b[2]<=0: continue
-            if actB[i] in self.ACT_MOVE_DIRS:
-                occB.remove((b[0],b[1]))
-                self._move_one(b, actB[i], occB)
-                occB.add((b[0],b[1]))
-        # shooting
-        def do_attacks(me, other, tag):
-            r_me = 0
-            for i,ag in enumerate(me):
-                if ag[2]<=0: continue
-                if ag[5]>0:
-                    ag[5]-=1
+            tx, ty = x + fx, y + fy
+            # 사거리와 산개 반영
+            best_j = None
+            best_d = None
+            for j in range(self.n):
+                ox, oy, ohp, *_ = other[j]
+                if ohp <= 0:
                     continue
-                if (tag=='A' and actA[i]==self.ACT_ATTACK) or (tag=='B' and actB[i]==self.ACT_ATTACK):
-                    hit_idx, end = self._line_hit(ag, other)
-                    sx,sy = ag[0],ag[1]
-                    if hit_idx>=0:
-                        ox,oy = other[hit_idx,0], other[hit_idx,1]
-                        other[hit_idx,2] -= 1
-                        shots.append({"from":[int(sx),int(sy)],"to":[int(ox),int(oy)],"hit":True,"team":tag})
-                        ag[5]=self.reload_steps
-                        r_me += 0.2
-                    else:
-                        tx,ty = end if end is not None else (sx,sy)
-                        shots.append({"from":[int(sx),int(sy)],"to":[int(tx),int(ty)],"hit":False,"team":tag})
-                        ag[5]=self.reload_steps
-            return r_me
-        rA = do_attacks(self.A, self.B, 'A')
-        rB = do_attacks(self.B, self.A, 'B')
+                d = self._distance(x, y, ox, oy)
+                if d == 0 or d > self.max_range:
+                    continue
+                vx = np.sign(ox - x)
+                vy = np.sign(oy - y)
+                if vx == fx and vy == fy:
+                    if self._bresenham_clear(x, y, ox, oy):
+                        if best_d is None or d < best_d:
+                            best_d = d
+                            best_j = j
+            if best_j is None:
+                continue
 
-        # base capture instant win
-        capA = any((x,y)==self.base_B for (x,y,hp,fx,fy,cd) in self.A if hp>0)
-        capB = any((x,y)==self.base_A for (x,y,hp,fx,fy,cd) in self.B if hp>0)
-
-        done=False
-        if capA and not capB:
-            done=True; rA += 10.0; rB -= 10.0
-            outcome = 'A_capture'
-        elif capB and not capA:
-            done=True; rA -= 10.0; rB += 10.0
-            outcome = 'B_capture'
-        else:
-            aliveA = self._alive_mask(self.A).sum()
-            aliveB = self._alive_mask(self.B).sum()
-            if aliveA==0 and aliveB>0:
-                done=True; rA -= 5.0; rB += 5.0; outcome='B_wipe'
-            elif aliveB==0 and aliveA>0:
-                done=True; rA += 5.0; rB -= 5.0; outcome='A_wipe'
-            elif self.t>=self.max_steps:
-                done=True; outcome='timeout'
+            ox, oy, ohp, ofx, ofy, ocd, obase = other[best_j]
+            # 측면/후방 보정(상대의 바라보는 방향 기준)
+            flanking = (ofx, ofy) != (-fx, -fy)
+            p = self.hit_prob + (self.flank_bonus if flanking else 0.0)
+            if self.rng.random() < p:
+                hits.append({
+                    "from": [int(x), int(y)],
+                    "to": [int(ox), int(oy)],
+                    "hit": True
+                })
+                me[i, 5] = base_cd  # 쿨다운 리셋
             else:
-                outcome=None
+                hits.append({
+                    "from": [int(x), int(y)],
+                    "to": [int(ox), int(oy)],
+                    "hit": False
+                })
+                me[i, 5] = max(1, base_cd // 2)
 
-        info = {"shots": shots, "base_A": self.base_A, "base_B": self.base_B, "outcome": outcome}
+        return hits
+
+    # ---------------- Step ----------------
+
+    def step(self, actA: np.ndarray, actB: np.ndarray):
+        assert actA.shape == (self.n,) and actB.shape == (self.n,)
+        self.t += 1
+
+        shots = []
+
+        # 쿨다운 감소
+        for i in range(self.n):
+            if self.A[i, 5] > 0:
+                self.A[i, 5] -= 1
+            if self.B[i, 5] > 0:
+                self.B[i, 5] -= 1
+
+        # 이동 처리
+        def apply_move(team, other, acts):
+            for i in range(self.n):
+                x, y, hp, fx, fy, cd, base_cd = team[i]
+                if hp <= 0:
+                    continue
+                a = int(acts[i])
+                if a == self.ACT_STAY:
+                    pass
+                elif a in self.ACT_MOVE_DIRS:
+                    dx, dy = self.ACT_MOVE_DIRS[a]
+                    nx, ny = x + dx, y + dy
+                    if self._in_bounds(nx, ny) and not self._blocked(nx, ny):
+                        team[i, 0] = nx
+                        team[i, 1] = ny
+                        team[i, 3] = dx  # facing
+                        team[i, 4] = dy
+                elif a == self.ACT_ATTACK:
+                    # 가장 가까운 생존 적을 향해 조준만 변경(위치 이동 없음)
+                    best = None
+                    best_d = None
+                    for j in range(self.n):
+                        ox, oy, ohp, *_ = other[j]
+                        if ohp <= 0:
+                            continue
+                        d = self._distance(x, y, ox, oy)
+                        if best_d is None or d < best_d:
+                            best_d = d
+                            best = (ox, oy)
+                    if best is not None:
+                        vx = int(np.sign(best[0] - x))
+                        vy = int(np.sign(best[1] - y))
+                        if vx != 0 or vy != 0:
+                            team[i, 3] = vx
+                            team[i, 4] = vy
+
+        apply_move(self.A, self.B, actA)
+        apply_move(self.B, self.A, actB)
+
+        # 공격 처리: 사거리/산개/명중률
+        hitsA = self._attack_targets(self.A, self.B)
+        hitsB = self._attack_targets(self.B, self.A)
+        shots.extend([{"team": "A", **h} for h in hitsA])
+        shots.extend([{"team": "B", **h} for h in hitsB])
+
+        # 피해 적용 및 보상
+        rA = 0.0
+        rB = 0.0
+
+        # 보상 셰이핑: 엄폐 인접 생존, 유효사거리 내 조준
+        def shaping_reward(team, other):
+            bonus = 0.0
+            for i in range(self.n):
+                x, y, hp, fx, fy, cd, base_cd = team[i]
+                if hp <= 0:
+                    continue
+                # 엄폐 인접
+                has_cover = False
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < self.width and 0 <= ny < self.height and self._blocked(nx, ny):
+                            has_cover = True
+                            break
+                    if has_cover:
+                        break
+                if has_cover:
+                    bonus += 0.03
+                # 유효사거리 내 조준
+                aligned_in_range = False
+                for j in range(self.n):
+                    ox, oy, ohp, *_ = other[j]
+                    if ohp <= 0:
+                        continue
+                    d = self._distance(x, y, ox, oy)
+                    if d == 0 or d > self.max_range:
+                        continue
+                    vx = np.sign(ox - x)
+                    vy = np.sign(oy - y)
+                    if vx == team[i, 3] and vy == team[i, 4]:
+                        aligned_in_range = True
+                        break
+                if aligned_in_range:
+                    bonus += 0.02
+            return bonus
+
+        rA += shaping_reward(self.A, self.B)
+        rB += shaping_reward(self.B, self.A)
+
+        # 명중 피해/보상
+        def apply_hits(hits, me, other, me_is_A: bool):
+            nonlocal rA, rB
+            for h in hits:
+                if not h["hit"]:
+                    continue
+                tx, ty = h["to"]
+                # 타겟 식별(가장 가까운 좌표 매칭)
+                best_j = None
+                best_d = None
+                for j in range(self.n):
+                    ox, oy, ohp, *_ = other[j]
+                    if ohp <= 0:
+                        continue
+                    d = self._distance(tx, ty, ox, oy)
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best_j = j
+                if best_j is None:
+                    continue
+                # 측면 보정
+                mx, my, mhp, mfx, mfy, mcd, mbase = me[0]  # 아무 유닛의 facing 참고용
+                fx, fy = mfx, mfy
+                ox, oy, ohp, ofx, ofy, ocd, obase = other[best_j]
+                flanking = (ofx, ofy) != (-fx, -fy)
+
+                other[best_j, 2] -= 1
+                if me_is_A:
+                    rA += 1.0 + (0.05 if flanking else 0.0)
+                    rB -= 1.0
+                else:
+                    rB += 1.0 + (0.05 if flanking else 0.0)
+                    rA -= 1.0
+
+        apply_hits(hitsA, self.A, self.B, True)
+        apply_hits(hitsB, self.B, self.A, False)
+
+        # 종료 조건
+        aliveA = int(np.sum(self.A[:, 2] > 0))
+        aliveB = int(np.sum(self.B[:, 2] > 0))
+        done = False
+        outcome = None
+        if self.t >= self.max_steps or aliveA == 0 or aliveB == 0:
+            done = True
+            if aliveA > aliveB:
+                rA += 5.0
+                rB -= 5.0
+                outcome = "A_wipe" if aliveB == 0 else "timeout"
+            elif aliveB > aliveA:
+                rB += 5.0
+                rA -= 5.0
+                outcome = "B_wipe" if aliveA == 0 else "timeout"
+            else:
+                outcome = "draw"
+
+        info = {
+            "shots": shots,
+            "blocks": self.blocks.copy(),
+            "aliveA": aliveA,
+            "aliveB": aliveB,
+            "outcome": outcome,
+        }
         return self._obs_team(self.A, self.B), self._obs_team(self.B, self.A), float(rA), float(rB), done, info
 
+    # -------- Observations --------
+
     def _obs_team(self, me, other):
+        # x,y,hp,fx,fy,cd,base_cd -> 7개
         return np.concatenate([me.flatten(), other.flatten()]).astype(np.int32)
 
+    def get_team_obs_dim(self):
+        return (7 * self.n * 2)
+
     def sample_actions(self):
-        return self.rng.randint(0, 10, size=self.n, dtype=np.int32)
+        return self.rng.integers(0, 10, size=self.n, dtype=np.int32)
