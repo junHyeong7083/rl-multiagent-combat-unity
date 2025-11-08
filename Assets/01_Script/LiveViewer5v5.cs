@@ -15,25 +15,29 @@ public class LiveViewer5v5 : MonoBehaviour
     [Header("Network")]
     public TransportMode transport = TransportMode.UDP;
     public string host = "127.0.0.1";
-    public int port = 7788;  // UDP 서버 기본 포트(수정한 Python 서버와 맞춤)
+    public int port = 7788;
 
     [Header("Prefabs")]
     public GameObject agentAPrefab;
     public GameObject agentBPrefab;
-    public GameObject bulletPrefab;   // Bullet.cs 포함 프리팹
+    public GameObject bulletPrefab;
+    [Tooltip("A팀 넥서스(기지) 프리팹")]
+    public GameObject aNexusPrefab;
+    [Tooltip("B팀 넥서스(기지) 프리팹")]
+    public GameObject bNexusPrefab;
 
     [Header("Grid -> World")]
     public float cellSize = 1.0f;
     public Vector3 origin = Vector3.zero;
     public float agentYOffset = 0.0f;
     public float bulletYOffset = 0.3f;
+    public float nexusYOffset = 0.02f;
 
     [Header("Smoothing")]
     public float followSpeed = 15f;
     public bool snapOnFirstFrame = true;
 
     [Header("Bullet Visual Tuning")]
-    [Tooltip("cellSize가 커져도 체감 속도 유지를 위한 배율")]
     public float bulletSpeedPerCell = 8f;
     public float bulletMinSpeed = 30f;
     public float bulletMaxLife = 1.0f;
@@ -61,6 +65,9 @@ public class LiveViewer5v5 : MonoBehaviour
     readonly List<Vector3> aTargets = new List<Vector3>();
     readonly List<Vector3> bTargets = new List<Vector3>();
 
+    // Nexus
+    GameObject aNexusObj, bNexusObj;
+
     void Start()
     {
         running = true;
@@ -74,7 +81,7 @@ public class LiveViewer5v5 : MonoBehaviour
         try { tcpClient?.Close(); } catch { }
         try { udpClient?.Close(); } catch { }
         try { recvThread?.Join(200); } catch { }
-        ClearAgents();
+        ClearScene();
     }
 
     // ===== 네트워크 수신 스레드 =====
@@ -118,8 +125,7 @@ public class LiveViewer5v5 : MonoBehaviour
                     var data = udpClient.Receive(ref udpRemote);
                     if (data == null || data.Length == 0) continue;
                     string s = Encoding.UTF8.GetString(data);
-                    // Python 서버는 한 패킷=한 프레임(JSON) 형태
-                    lineQueue.Enqueue(s);
+                    lineQueue.Enqueue(s); // 한 패킷 = 한 프레임(JSON)
                 }
             }
         }
@@ -138,9 +144,8 @@ public class LiveViewer5v5 : MonoBehaviour
             {
                 var jo = JObject.Parse(line);
 
-                // 1) 구(舊) TCP 라인 프로토콜: "type": "meta|reset|frame|done"
+                // 1) 구(TCP) 프로토콜: {type:"meta|reset|frame|done", ...}
                 string type = jo.Value<string>("type");
-
                 if (!string.IsNullOrEmpty(type))
                 {
                     if (type == "meta")
@@ -151,6 +156,7 @@ public class LiveViewer5v5 : MonoBehaviour
                         gotFirstFrame = false;
                         if (showLog) Debug.Log($"[Live] meta: {gridW}x{gridH}, n={nAgents}");
                         RespawnAgents(nAgents);
+                        EnsureNexus(null, null);
                     }
                     else if (type == "reset")
                     {
@@ -169,7 +175,7 @@ public class LiveViewer5v5 : MonoBehaviour
                     continue;
                 }
 
-                // 2) 신(新) UDP 프레임 프로토콜: {t,width,height,baseA,baseB,A,B,shots,outcome}
+                // 2) 신(UDP) 프로토콜: {t,width,height,baseA/baseB or base_A/base_B,A,B,shots,outcome}
                 ApplyFrameFromUdpServer(jo);
                 FirstFrameSnapIfNeeded();
             }
@@ -204,22 +210,29 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
-    // ===== 에이전트 관리 =====
-    void ClearAgents()
+    // ===== 에이전트/넥서스 관리 =====
+    void ClearScene()
     {
         foreach (var go in aAgents) if (go) Destroy(go);
         foreach (var go in bAgents) if (go) Destroy(go);
         aAgents.Clear(); bAgents.Clear();
         aTargets.Clear(); bTargets.Clear();
+
+        if (aNexusObj) Destroy(aNexusObj);
+        if (bNexusObj) Destroy(bNexusObj);
+        aNexusObj = null; bNexusObj = null;
     }
 
     void RespawnAgents(int n)
     {
-        ClearAgents();
+        foreach (var go in aAgents) if (go) Destroy(go);
+        foreach (var go in bAgents) if (go) Destroy(go);
+        aAgents.Clear(); bAgents.Clear();
+        aTargets.Clear(); bTargets.Clear();
 
         if (!agentAPrefab || !agentBPrefab)
         {
-            Debug.LogError("[Live] Prefabs not assigned.");
+            Debug.LogError("[Live] Agent Prefabs not assigned.");
             return;
         }
 
@@ -239,6 +252,46 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
+    // (x,y)가 각각 null일 수 있으므로 nullable 튜플로 받음
+    void EnsureNexus((int x, int y)? baseA, (int x, int y)? baseB)
+    {
+        if (baseA.HasValue)
+        {
+            Vector3 wA = GridToWorld(baseA.Value.x, baseA.Value.y, nexusYOffset);
+            if (!aNexusObj && aNexusPrefab)
+                aNexusObj = Instantiate(aNexusPrefab, wA, Quaternion.identity, transform);
+            if (aNexusObj) aNexusObj.transform.position = wA;
+        }
+        if (baseB.HasValue)
+        {
+            Vector3 wB = GridToWorld(baseB.Value.x, baseB.Value.y, nexusYOffset);
+            if (!bNexusObj && bNexusPrefab)
+                bNexusObj = Instantiate(bNexusPrefab, wB, Quaternion.identity, transform);
+            if (bNexusObj) bNexusObj.transform.position = wB;
+        }
+    }
+
+    // JObject/JArray 혼용으로 오는 좌표를 안전하게 꺼내기
+    (int x, int y)? TryReadBaseXY(JToken token)
+    {
+        if (token == null) return null;
+
+        // 새 포맷: { "x": int, "y": int }
+        if (token is JObject o)
+        {
+            if (o["x"] != null && o["y"] != null)
+                return (o.Value<int>("x"), o.Value<int>("y"));
+        }
+
+        // 구 포맷: [x, y]
+        if (token is JArray arr && arr.Count >= 2)
+        {
+            return (arr[0].ToObject<int>(), arr[1].ToObject<int>());
+        }
+
+        return null;
+    }
+
     // ===== 구 프로토콜(frame) 적용 =====
     void ApplyFrameLikeLegacy(JObject frame)
     {
@@ -247,8 +300,12 @@ public class LiveViewer5v5 : MonoBehaviour
         if (A != null && A.Count != aAgents.Count) RespawnAgents(A.Count);
         if (B != null && B.Count != bAgents.Count) RespawnAgents(B.Count);
 
-        int aAlive = 0, bAlive = 0;
+        // base_A/base_B 또는 baseA/baseB 모두 지원
+        var baseA = TryReadBaseXY(frame["base_A"]) ?? TryReadBaseXY(frame["baseA"]) ?? TryReadBaseXY(frame["nexusA"]);
+        var baseB = TryReadBaseXY(frame["base_B"]) ?? TryReadBaseXY(frame["baseB"]) ?? TryReadBaseXY(frame["nexusB"]);
+        EnsureNexus(baseA, baseB);
 
+        int aAlive = 0, bAlive = 0;
         for (int i = 0; i < aAgents.Count; i++)
         {
             var a = (JArray)A[i]; // [x,y,hp,fx,fy,cd]
@@ -277,11 +334,16 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
-    // ===== 신 프로토콜(UDP) 적용 =====
+    // ===== 신(UDP) 프로토콜 적용 =====
     void ApplyFrameFromUdpServer(JObject jo)
     {
         gridW = jo.Value<int?>("width") ?? gridW;
         gridH = jo.Value<int?>("height") ?? gridH;
+
+        // baseA/baseB 또는 base_A/base_B/nexusA/nexusB 지원
+        var baseA = TryReadBaseXY(jo["baseA"]) ?? TryReadBaseXY(jo["base_A"]) ?? TryReadBaseXY(jo["nexusA"]);
+        var baseB = TryReadBaseXY(jo["baseB"]) ?? TryReadBaseXY(jo["base_B"]) ?? TryReadBaseXY(jo["nexusB"]);
+        EnsureNexus(baseA, baseB);
 
         var A = (JArray)jo["A"];
         var B = (JArray)jo["B"];
@@ -337,7 +399,6 @@ public class LiveViewer5v5 : MonoBehaviour
             Vector3 wFrom = GridToWorld(fx, fy, bulletYOffset);
             Vector3 wTo = GridToWorld(tx, ty, bulletYOffset);
 
-            // 총구 위치 약간 앞으로 보정
             Vector3 dir = (wTo - wFrom);
             Vector3 ndir = dir.sqrMagnitude > 1e-10f ? dir.normalized : Vector3.forward;
             wFrom += ndir * (0.3f * cellSize);
@@ -352,7 +413,6 @@ public class LiveViewer5v5 : MonoBehaviour
                 bullet.FireTo(wTo);
             }
 
-            // 팀/히트 컬러 피드백(있는 경우)
             string team = jo.Value<string>("team"); // "A" or "B"
             bool hit = jo.Value<bool?>("hit") ?? false;
             var rend = go.GetComponentInChildren<Renderer>();
@@ -364,10 +424,9 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
-    // ===== 보조 함수 =====
+    // ===== 보조 =====
     Vector3 GridToWorld(int gx, int gy, float yOffset = 0f)
     {
-        // 격자 중심에 정렬(+0.5)
         return origin + new Vector3((gx + 0.5f) * cellSize, yOffset, (gy + 0.5f) * cellSize);
     }
 }

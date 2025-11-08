@@ -122,12 +122,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 41528c816bc98b74f81f26b17baf4a1f, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  speed: 30
-  maxLife: 2
+  speed: 120
+  maxLife: 3
   faceDirection: 1
+  arriveDistance: 0.03
   destroyOnArrive: 1
   hitEffectPrefab: {fileID: 0}
   trail: {fileID: 3802181156060134365}
+  followTarget: {fileID: 0}
+  homingStrength: 0.25
   target: {x: 0, y: 0, z: 0}
 --- !u!96 &3802181156060134365
 TrailRenderer:

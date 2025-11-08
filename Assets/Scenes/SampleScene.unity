@@ -479,9 +479,25 @@ PrefabInstance:
       value: LiveStreaming
       objectReference: {fileID: 0}
     - target: {fileID: 6125888482861827394, guid: 100fee7d63dc19441a7dce255780308c, type: 3}
+      propertyPath: port
+      value: 7788
+      objectReference: {fileID: 0}
+    - target: {fileID: 6125888482861827394, guid: 100fee7d63dc19441a7dce255780308c, type: 3}
       propertyPath: showLog
       value: 1
       objectReference: {fileID: 0}
+    - target: {fileID: 6125888482861827394, guid: 100fee7d63dc19441a7dce255780308c, type: 3}
+      propertyPath: cellSize
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 6125888482861827394, guid: 100fee7d63dc19441a7dce255780308c, type: 3}
+      propertyPath: aNexusPrefab
+      value: 
+      objectReference: {fileID: 3089716584891524147, guid: eb99b139b75c83544914424442d9ef5c, type: 3}
+    - target: {fileID: 6125888482861827394, guid: 100fee7d63dc19441a7dce255780308c, type: 3}
+      propertyPath: bNexusPrefab
+      value: 
+      objectReference: {fileID: 3089716584891524147, guid: 88d342e656a80294d9195f377412c82d, type: 3}
     - target: {fileID: 6125888482861827394, guid: 100fee7d63dc19441a7dce255780308c, type: 3}
       propertyPath: bulletPrefab
       value: 

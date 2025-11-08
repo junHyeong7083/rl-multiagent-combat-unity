@@ -3,9 +3,13 @@ using UnityEngine;
 public class Bullet : MonoBehaviour
 {
     [Header("Motion")]
-    [Min(0.01f)] public float speed = 30f;   // units/sec
-    [Min(0.01f)] public float maxLife = 2f;  // seconds
+    [Min(0.01f)] public float speed = 120f;   // ↑ 빠르게 (연출 싱크 개선)
+    [Min(0.01f)] public float maxLife = 3f;   // ↑ 약간 여유
     public bool faceDirection = true;
+
+    [Header("Arrival")]
+    [Tooltip("목표점과 이 거리 이하이면 도달로 처리")]
+    [Min(0f)] public float arriveDistance = 0.03f;
 
     [Header("Hit")]
     public bool destroyOnArrive = true;
@@ -14,15 +18,23 @@ public class Bullet : MonoBehaviour
     [Header("Trail (optional)")]
     public TrailRenderer trail;
 
+    [Header("Optional Homing")]
+    [Tooltip("지정하면 매 프레임 목표를 이 트랜스폼 위치로 보정")]
+    public Transform followTarget;
+    [Range(0f, 1f)]
+    [Tooltip("0이면 고정 목표, 1이면 완전 추적. 0.15~0.35 권장")]
+    public float homingStrength = 0.25f;
+
     [HideInInspector] public Vector3 target;
 
     float life;
     bool fired;
 
     /// <summary>스폰 직후 목표 세팅 + 발사</summary>
-    public void FireTo(Vector3 worldTarget)
+    public void FireTo(Vector3 worldTarget, Transform follow = null)
     {
         target = worldTarget;
+        followTarget = follow; // null이면 고정 목표 모드
         fired = true;
 
         if (faceDirection)
@@ -56,21 +68,26 @@ public class Bullet : MonoBehaviour
         }
         if (!fired) return;
 
+        // 선택적 호밍: 목표가 있으면 부드럽게 목표점 업데이트
+        if (followTarget)
+        {
+            Vector3 desired = followTarget.position;
+            target = Vector3.Lerp(target, desired, homingStrength);
+        }
+
         // 타겟으로 직선 이동
         Vector3 to = target - transform.position;
-        float sqr = to.sqrMagnitude;
+        float dist = to.magnitude;
 
-        if (sqr <= 1e-10f)
+        // 근접 처리
+        if (dist <= arriveDistance)
         {
-            // 거의 도달한 상태면 즉시 처리
             transform.position = target;
             Arrive();
             return;
         }
 
-        float dist = Mathf.Sqrt(sqr);
         float step = speed * Time.deltaTime;
-
         if (step >= dist)
         {
             transform.position = target;
@@ -104,7 +121,6 @@ public class Bullet : MonoBehaviour
             try
             {
                 trail.transform.SetParent(null, true);
-                // TrailRenderer가 비활성화될 수 있으니 먼저 켜두기
                 if (!trail.gameObject.activeSelf) trail.gameObject.SetActive(true);
                 Destroy(trail.gameObject, trail.time + 0.1f);
             }
