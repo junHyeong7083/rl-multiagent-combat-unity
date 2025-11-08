@@ -1,4 +1,4 @@
-using System;
+ï»¿using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Net;
@@ -21,17 +21,26 @@ public class LiveViewer5v5 : MonoBehaviour
     public GameObject agentAPrefab;
     public GameObject agentBPrefab;
     public GameObject bulletPrefab;
-    [Tooltip("AÆÀ ³Ø¼­½º(±âÁö) ÇÁ¸®ÆÕ")]
+    [Tooltip("AíŒ€ ë„¥ì„œìŠ¤(ê¸°ì§€) í”„ë¦¬íŒ¹")]
     public GameObject aNexusPrefab;
-    [Tooltip("BÆÀ ³Ø¼­½º(±âÁö) ÇÁ¸®ÆÕ")]
+    [Tooltip("BíŒ€ ë„¥ì„œìŠ¤(ê¸°ì§€) í”„ë¦¬íŒ¹")]
     public GameObject bNexusPrefab;
+    [Tooltip("ì¥ì• ë¬¼ í”„ë¦¬íŒ¹ (íë¸Œ ë“±)")]
+    public GameObject obstaclePrefab;
+
+    [Header("Parents (optional)")]
+    public Transform unitRoot;     // ì—†ìœ¼ë©´ ì”¬ ë£¨íŠ¸
+    public Transform bulletRoot;   // ì—†ìœ¼ë©´ ì”¬ ë£¨íŠ¸
+    public Transform nexusRoot;    // ì—†ìœ¼ë©´ ì”¬ ë£¨íŠ¸
+    public Transform obstacleRoot; // ì—†ìœ¼ë©´ ì”¬ ë£¨íŠ¸
 
     [Header("Grid -> World")]
-    public float cellSize = 1.0f;
+    public float cellSize = 1.0f;        // ì„œë²„ map.cellì´ ì˜¤ë©´ ê·¸ ê°’ìœ¼ë¡œ ë®ì–´ì”€
     public Vector3 origin = Vector3.zero;
     public float agentYOffset = 0.0f;
     public float bulletYOffset = 0.3f;
     public float nexusYOffset = 0.02f;
+    public float obstacleYOffset = 0.0f;
 
     [Header("Smoothing")]
     public float followSpeed = 15f;
@@ -45,7 +54,7 @@ public class LiveViewer5v5 : MonoBehaviour
     [Header("Debug")]
     public bool showLog = false;
 
-    // ===== ³»ºÎ »óÅÂ =====
+    // ===== ë‚´ë¶€ ìƒíƒœ =====
     Thread recvThread;
     volatile bool running;
     ConcurrentQueue<string> lineQueue = new ConcurrentQueue<string>();
@@ -68,6 +77,11 @@ public class LiveViewer5v5 : MonoBehaviour
     // Nexus
     GameObject aNexusObj, bNexusObj;
 
+    // Obstacles
+    readonly List<GameObject> obstaclePool = new List<GameObject>();
+    int cachedObsVer = -1;      // ì„œë²„ì—ì„œ ë³´ë‚´ëŠ” obs_verê³¼ ë™ê¸°í™”
+    float serverCellSize = -1f; // ì„œë²„ map.cell (ì—†ìœ¼ë©´ -1 â†’ cellSize ì‚¬ìš©)
+
     void Start()
     {
         running = true;
@@ -82,9 +96,10 @@ public class LiveViewer5v5 : MonoBehaviour
         try { udpClient?.Close(); } catch { }
         try { recvThread?.Join(200); } catch { }
         ClearScene();
+        ClearObstacles();
     }
 
-    // ===== ³×Æ®¿öÅ© ¼ö½Å ½º·¹µå =====
+    // ===== ë„¤íŠ¸ì›Œí¬ ìˆ˜ì‹  ìŠ¤ë ˆë“œ =====
     void NetThread()
     {
         try
@@ -125,7 +140,7 @@ public class LiveViewer5v5 : MonoBehaviour
                     var data = udpClient.Receive(ref udpRemote);
                     if (data == null || data.Length == 0) continue;
                     string s = Encoding.UTF8.GetString(data);
-                    lineQueue.Enqueue(s); // ÇÑ ÆĞÅ¶ = ÇÑ ÇÁ·¹ÀÓ(JSON)
+                    lineQueue.Enqueue(s); // í•œ íŒ¨í‚· = í•œ í”„ë ˆì„(JSON)
                 }
             }
         }
@@ -135,7 +150,7 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
-    // ===== ¸ŞÀÎ ½º·¹µå Ã³¸® =====
+    // ===== ë©”ì¸ ìŠ¤ë ˆë“œ ì²˜ë¦¬ =====
     void Update()
     {
         while (lineQueue.TryDequeue(out string line))
@@ -144,7 +159,7 @@ public class LiveViewer5v5 : MonoBehaviour
             {
                 var jo = JObject.Parse(line);
 
-                // 1) ±¸(TCP) ÇÁ·ÎÅäÄİ: {type:"meta|reset|frame|done", ...}
+                // 1) êµ¬(TCP) í”„ë¡œí† ì½œ: {type:"meta|reset|frame|done", ...}
                 string type = jo.Value<string>("type");
                 if (!string.IsNullOrEmpty(type))
                 {
@@ -175,7 +190,7 @@ public class LiveViewer5v5 : MonoBehaviour
                     continue;
                 }
 
-                // 2) ½Å(UDP) ÇÁ·ÎÅäÄİ: {t,width,height,baseA/baseB or base_A/base_B,A,B,shots,outcome}
+                // 2) ì‹ (UDP) í”„ë¡œí† ì½œ
                 ApplyFrameFromUdpServer(jo);
                 FirstFrameSnapIfNeeded();
             }
@@ -185,7 +200,7 @@ public class LiveViewer5v5 : MonoBehaviour
             }
         }
 
-        // ÇÁ·¹ÀÓ °£ º¸°£ ÀÌµ¿
+        // í”„ë ˆì„ ê°„ ë³´ê°„ ì´ë™
         for (int i = 0; i < aAgents.Count; i++)
         {
             if (aAgents[i])
@@ -210,7 +225,7 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
-    // ===== ¿¡ÀÌÀüÆ®/³Ø¼­½º °ü¸® =====
+    // ===== ì—ì´ì „íŠ¸/ë„¥ì„œìŠ¤ ê´€ë¦¬ =====
     void ClearScene()
     {
         foreach (var go in aAgents) if (go) Destroy(go);
@@ -236,63 +251,59 @@ public class LiveViewer5v5 : MonoBehaviour
             return;
         }
 
+        Transform parent = unitRoot != null ? unitRoot : null;
+
         for (int i = 0; i < n; i++)
         {
-            var a = Instantiate(agentAPrefab, transform);
-            var b = Instantiate(agentBPrefab, transform);
+            var a = Instantiate(agentAPrefab, parent);
+            var b = Instantiate(agentBPrefab, parent);
             aAgents.Add(a); bAgents.Add(b);
 
             var p = origin + Vector3.up * agentYOffset;
             a.transform.position = p;
             b.transform.position = p;
-            a.SetActive(true); b.SetActive(true);
 
             aTargets.Add(p);
             bTargets.Add(p);
+
+            a.SetActive(true); b.SetActive(true);
         }
     }
 
-    // (x,y)°¡ °¢°¢ nullÀÏ ¼ö ÀÖÀ¸¹Ç·Î nullable Æ©ÇÃ·Î ¹ŞÀ½
     void EnsureNexus((int x, int y)? baseA, (int x, int y)? baseB)
     {
+        Transform parent = nexusRoot != null ? nexusRoot : null;
+
         if (baseA.HasValue)
         {
             Vector3 wA = GridToWorld(baseA.Value.x, baseA.Value.y, nexusYOffset);
             if (!aNexusObj && aNexusPrefab)
-                aNexusObj = Instantiate(aNexusPrefab, wA, Quaternion.identity, transform);
+                aNexusObj = Instantiate(aNexusPrefab, wA, Quaternion.identity, parent);
             if (aNexusObj) aNexusObj.transform.position = wA;
         }
         if (baseB.HasValue)
         {
             Vector3 wB = GridToWorld(baseB.Value.x, baseB.Value.y, nexusYOffset);
             if (!bNexusObj && bNexusPrefab)
-                bNexusObj = Instantiate(bNexusPrefab, wB, Quaternion.identity, transform);
+                bNexusObj = Instantiate(bNexusPrefab, wB, Quaternion.identity, parent);
             if (bNexusObj) bNexusObj.transform.position = wB;
         }
     }
 
-    // JObject/JArray È¥¿ëÀ¸·Î ¿À´Â ÁÂÇ¥¸¦ ¾ÈÀüÇÏ°Ô ²¨³»±â
     (int x, int y)? TryReadBaseXY(JToken token)
     {
         if (token == null) return null;
-
-        // »õ Æ÷¸Ë: { "x": int, "y": int }
         if (token is JObject o)
         {
             if (o["x"] != null && o["y"] != null)
                 return (o.Value<int>("x"), o.Value<int>("y"));
         }
-
-        // ±¸ Æ÷¸Ë: [x, y]
         if (token is JArray arr && arr.Count >= 2)
-        {
             return (arr[0].ToObject<int>(), arr[1].ToObject<int>());
-        }
-
         return null;
     }
 
-    // ===== ±¸ ÇÁ·ÎÅäÄİ(frame) Àû¿ë =====
+    // ===== êµ¬ í”„ë¡œí† ì½œ(frame) ì ìš© =====
     void ApplyFrameLikeLegacy(JObject frame)
     {
         var A = (JArray)frame["A"];
@@ -300,7 +311,6 @@ public class LiveViewer5v5 : MonoBehaviour
         if (A != null && A.Count != aAgents.Count) RespawnAgents(A.Count);
         if (B != null && B.Count != bAgents.Count) RespawnAgents(B.Count);
 
-        // base_A/base_B ¶Ç´Â baseA/baseB ¸ğµÎ Áö¿ø
         var baseA = TryReadBaseXY(frame["base_A"]) ?? TryReadBaseXY(frame["baseA"]) ?? TryReadBaseXY(frame["nexusA"]);
         var baseB = TryReadBaseXY(frame["base_B"]) ?? TryReadBaseXY(frame["baseB"]) ?? TryReadBaseXY(frame["nexusB"]);
         EnsureNexus(baseA, baseB);
@@ -334,17 +344,35 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
-    // ===== ½Å(UDP) ÇÁ·ÎÅäÄİ Àû¿ë =====
+    // ===== ì‹ (UDP) í”„ë¡œí† ì½œ ì ìš© =====
     void ApplyFrameFromUdpServer(JObject jo)
     {
+        // ë§µ/ì…€í¬ê¸°
         gridW = jo.Value<int?>("width") ?? gridW;
         gridH = jo.Value<int?>("height") ?? gridH;
+        var map = jo["map"] as JObject;
+        if (map != null)
+        {
+            // ì„œë²„ê°€ cellì„ ì£¼ë©´ ì‚¬ìš©, ì•„ë‹ˆë©´ ê¸°ì¡´ cellSize ìœ ì§€
+            serverCellSize = map.Value<float?>("cell") ?? serverCellSize;
+            if (serverCellSize > 0f) cellSize = serverCellSize;
+        }
 
-        // baseA/baseB ¶Ç´Â base_A/base_B/nexusA/nexusB Áö¿ø
+        // ë„¥ì„œìŠ¤
         var baseA = TryReadBaseXY(jo["baseA"]) ?? TryReadBaseXY(jo["base_A"]) ?? TryReadBaseXY(jo["nexusA"]);
         var baseB = TryReadBaseXY(jo["baseB"]) ?? TryReadBaseXY(jo["base_B"]) ?? TryReadBaseXY(jo["nexusB"]);
         EnsureNexus(baseA, baseB);
 
+        // ì¥ì• ë¬¼: obs_ver ë°”ë€Œë©´ ê°±ì‹ 
+        int obsVer = jo.Value<int?>("obs_ver") ?? cachedObsVer;
+        var obstacles = jo["obstacles"] as JArray;
+        if (obstacles != null && obsVer != cachedObsVer)
+        {
+            UpdateObstacles(obstacles);
+            cachedObsVer = obsVer;
+        }
+
+        // ìœ ë‹›
         var A = (JArray)jo["A"];
         var B = (JArray)jo["B"];
         if (A == null || B == null) return;
@@ -371,26 +399,65 @@ public class LiveViewer5v5 : MonoBehaviour
             if (bhp > 0) bAlive++;
         }
 
+        // ì´ì•Œ
         SpawnBulletsFromShots(jo["shots"] as JArray);
 
         if (showLog)
         {
             int t = jo["t"]?.ToObject<int>() ?? 0;
             string outcome = jo.Value<string>("outcome");
-            Debug.Log($"[UDP t {t}] A_alive={aAlive} B_alive={bAlive} outcome={outcome}");
+            Debug.Log($"[UDP t {t}] A_alive={aAlive} B_alive={bAlive} outcome={outcome} obs_ver={cachedObsVer}");
         }
     }
 
-    // ===== ÃÑ¾Ë ¿¬Ãâ =====
+    // ===== ì¥ì• ë¬¼ ìƒì„±/ê°±ì‹  =====
+    void UpdateObstacles(JArray arr)
+    {
+        ClearObstacles();
+
+        if (!obstaclePrefab)
+        {
+            Debug.LogWarning("[Live] obstaclePrefab not assigned â€” ì¥ì• ë¬¼ ì¢Œí‘œëŠ” ë°›ì•˜ì§€ë§Œ í”„ë¦¬íŒ¹ì´ ì—†ì–´ ì‹œê°í™”í•˜ì§€ ì•ŠìŠµë‹ˆë‹¤.");
+            return;
+        }
+
+        Transform parent = obstacleRoot != null ? obstacleRoot : null;
+
+        for (int i = 0; i < arr.Count; i++)
+        {
+            var xy = arr[i] as JArray;
+            if (xy == null || xy.Count < 2) continue;
+
+            int x = xy[0].ToObject<int>();
+            int y = xy[1].ToObject<int>();
+
+            Vector3 pos = GridToWorld(x, y, obstacleYOffset);
+            var go = Instantiate(obstaclePrefab, pos, Quaternion.identity, parent);
+            obstaclePool.Add(go);
+        }
+    }
+
+    void ClearObstacles()
+    {
+        for (int i = 0; i < obstaclePool.Count; i++)
+            if (obstaclePool[i]) Destroy(obstaclePool[i]);
+        obstaclePool.Clear();
+    }
+
+    // ===== ì´ì•Œ ì—°ì¶œ =====
     void SpawnBulletsFromShots(JArray shots)
     {
         if (shots == null || !bulletPrefab) return;
 
+        Transform parent = bulletRoot != null ? bulletRoot : null;
+
         foreach (var s in shots)
         {
             var jo = (JObject)s;
-            var from = jo["from"] as JArray;
-            var to = jo["to"] as JArray;
+
+            // ìƒˆ í¬ë§· í˜¸í™˜ (from_xy/to_xy) ë˜ëŠ” êµ¬ í¬ë§· (from/to)
+            var from = (jo["from_xy"] as JArray) ?? (jo["from"] as JArray);
+            var to = (jo["to_xy"] as JArray) ?? (jo["to"] as JArray);
             if (from == null || to == null) continue;
 
             int fx = from[0].ToObject<int>(), fy = from[1].ToObject<int>();
@@ -403,7 +470,7 @@ public class LiveViewer5v5 : MonoBehaviour
             Vector3 ndir = dir.sqrMagnitude > 1e-10f ? dir.normalized : Vector3.forward;
             wFrom += ndir * (0.3f * cellSize);
 
-            var go = Instantiate(bulletPrefab, wFrom, Quaternion.LookRotation(ndir, Vector3.up), transform);
+            var go = Instantiate(bulletPrefab, wFrom, Quaternion.LookRotation(ndir, Vector3.up), parent);
 
             var bullet = go.GetComponent<Bullet>();
             if (bullet)
@@ -424,9 +491,10 @@ public class LiveViewer5v5 : MonoBehaviour
         }
     }
 
-    // ===== º¸Á¶ =====
+    // ===== ë³´ì¡° =====
     Vector3 GridToWorld(int gx, int gy, float yOffset = 0f)
     {
-        return origin + new Vector3((gx + 0.5f) * cellSize, yOffset, (gy + 0.5f) * cellSize);
+        float cs = (serverCellSize > 0f) ? serverCellSize : cellSize;
+        return origin + new Vector3((gx + 0.5f) * cs, yOffset, (gy + 0.5f) * cs);
     }
 }

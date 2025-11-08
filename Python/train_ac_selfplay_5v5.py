@@ -1,9 +1,6 @@
 # train_ac_selfplay_5v5.py
-import os
-import argparse
-import numpy as np
-import torch
-import torch.nn as nn
+import os, argparse, torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 
@@ -12,284 +9,271 @@ from ac_model import TeamTacticActorCritic, UnitActorCritic
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def eye_n(n): 
+    return torch.eye(n, device=DEVICE)
 
-# ----------------------------
-# Utils
-# ----------------------------
-def make_unit_onehots(n, device):
-    # shape: [n, n] (아이디 원-핫)
-    return torch.eye(n, device=device)
-
-
-def rollout(env, teamA, unitA, teamB, unitB, horizon, num_tactics, eps=0.0):
+def rollout(env, teamA, unitA, teamB, unitB, horizon, num_tactics, eps=0.05, temp=1.0):
     """
-    하나의 롤아웃을 수집. 팀 A/B 각각 별도 정책을 사용.
-    eps>0면 유닛 행동에 ε-greedy를 섞어 탐험 유도.
+    계층형 롤아웃: 팀 전술(분포)에서 유닛별 z 샘플 → 유닛 자율/지시 혼합 로짓
+    그래프 유지를 위해 모델 출력 텐서들에 detach() 금지!
     """
-    buf = {
-        "obsA": [], "obsB": [], "zA": [], "zB": [],
-        "uobsA": [], "uobsB": [], "uidA": [], "uidB": [],
-        "actA": [], "actB": [], "logpA": [], "logpB": [],
-        "vA": [], "vB": [],
-        "rA": [], "rB": [], "done": []
-    }
-
-    team_obs_A, team_obs_B = env.reset()
+    buf = {k: [] for k in [
+        # 팀 관측/전술
+        "obsA","obsB","zA_vec","zB_vec","logp_zA","logp_zB","v_teamA","v_teamB","ent_zA","ent_zB",
+        # 유닛
+        "ulogsA","ulogsB","logpA","logpB","vA","vB","alphaA","alphaB","localA","localB","priorA","priorB",
+        "actA","actB",
+        # 보상/종료
+        "rA","rB","done"
+    ]}
+    obsA, obsB = env.reset()
     n = env.n
-    uid_eye = make_unit_onehots(n, DEVICE)  # [n, n]
+    uid_eye = eye_n(n)
 
     for _ in range(horizon):
-        tA = torch.tensor(team_obs_A, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-        tB = torch.tensor(team_obs_B, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        tA = torch.tensor(obsA, dtype=torch.float32, device=DEVICE).unsqueeze(0)  # [1, obs]
+        tB = torch.tensor(obsB, dtype=torch.float32, device=DEVICE).unsqueeze(0)  # [1, obs]
 
-        # 팀 전술 샘플
-        logits_zA, v_teamA = teamA(tA)
-        logits_zB, v_teamB = teamB(tB)
-        zA = Categorical(logits=logits_zA).sample().item()
-        zB = Categorical(logits=logits_zB).sample().item()
+        # 팀 전술 분포
+        logits_zA, v_tA = teamA(tA)            # logits [1,Z], value [1,1] or [1]
+        logits_zB, v_tB = teamB(tB)
+        pi_zA = Categorical(logits=logits_zA / max(1e-8, temp))
+        pi_zB = Categorical(logits=logits_zB / max(1e-8, temp))
 
-        zA_oh = torch.nn.functional.one_hot(torch.tensor([zA], device=DEVICE),
-                                            num_classes=num_tactics).float()
-        zB_oh = torch.nn.functional.one_hot(torch.tensor([zB], device=DEVICE),
-                                            num_classes=num_tactics).float()
+        # 유닛별 전술 샘플 (sample_shape=n → [n,1])
+        zA_vec_raw = pi_zA.sample((n,))   # [n, 1]
+        zB_vec_raw = pi_zB.sample((n,))   # [n, 1]
+        zA_vec = zA_vec_raw.squeeze(-1)   # [n]
+        zB_vec = zB_vec_raw.squeeze(-1)   # [n]
 
-        # 유닛 정책
-        tA_rep = tA.repeat(n, 1)
-        tB_rep = tB.repeat(n, 1)
-        zA_rep = zA_oh.repeat(n, 1)
-        zB_rep = zB_oh.repeat(n, 1)
-        uidA = uid_eye
-        uidB = uid_eye
+        zA_oh  = F.one_hot(zA_vec, num_classes=num_tactics).float()  # [n,Z]
+        zB_oh  = F.one_hot(zB_vec, num_classes=num_tactics).float()  # [n,Z]
 
-        logits_uA, vA = unitA(tA_rep, zA_rep, uidA)
-        logits_uB, vB = unitB(tB_rep, zB_rep, uidB)
+        # 유닛 정책 (자율+prior 혼합 로짓) — UnitActorCritic는 팀 관측 [B,obs] 입력
+        ulogitsA, vA, alphaA, localA, priorA = unitA(tA, zA_oh, uid_eye)  # [n,A], [n], [n], [n,A], [n,A]
+        ulogitsB, vB, alphaB, localB, priorB = unitB(tB, zB_oh, uid_eye)
 
-        piA = Categorical(logits=logits_uA)
-        piB = Categorical(logits=logits_uB)
-        aA = piA.sample()
-        aB = piB.sample()
+        # 샘플링 (+ ε-greedy)
+        piA = Categorical(logits=ulogitsA)
+        piB = Categorical(logits=ulogitsB)
+        aA = piA.sample()  # [n]
+        aB = piB.sample()  # [n]
 
-        # ε-greedy
         if eps > 0.0:
             with torch.no_grad():
-                randA = torch.rand_like(aA.float()) < eps
-                randB = torch.rand_like(aB.float()) < eps
-                if randA.any():
-                    aA[randA] = torch.randint(0, ACTION_NUM, (int(randA.sum().item()),), device=aA.device)
-                if randB.any():
-                    aB[randB] = torch.randint(0, ACTION_NUM, (int(randB.sum().item()),), device=aB.device)
+                maskA = (torch.rand(n, device=DEVICE) < eps)
+                maskB = (torch.rand(n, device=DEVICE) < eps)
+                if maskA.any():
+                    aA[maskA] = torch.randint(0, ACTION_NUM, (int(maskA.sum().item()),), device=DEVICE)
+                if maskB.any():
+                    aB[maskB] = torch.randint(0, ACTION_NUM, (int(maskB.sum().item()),), device=DEVICE)
 
-        logpA = piA.log_prob(aA)
-        logpB = piB.log_prob(aB)
+        # 환경 step (환경 인자로만 numpy 변환)
+        obsA, obsB, rA, rB, done, _info = env.step(aA.cpu().numpy(), aB.cpu().numpy())
 
-        # env step
-        aA_np = aA.detach().cpu().numpy().astype(np.int32)
-        aB_np = aB.detach().cpu().numpy().astype(np.int32)
-        nextA, nextB, rA, rB, done, info = env.step(aA_np, aB_np)
-
-        # 버퍼 적재 (학습 그래프는 다음 단계에서 재구성하므로 detach)
-        buf["obsA"].append(tA.squeeze(0))
+        # ==== 버퍼 적재 (detach 금지) ====
+        # 팀
+        buf["obsA"].append(tA.squeeze(0))                              # [obs]
         buf["obsB"].append(tB.squeeze(0))
-        buf["zA"].append(zA)
-        buf["zB"].append(zB)
-        buf["uobsA"].append(tA_rep.detach())
-        buf["uobsB"].append(tB_rep.detach())
-        buf["uidA"].append(uidA.detach())
-        buf["uidB"].append(uidB.detach())
-        buf["actA"].append(aA.detach())
-        buf["actB"].append(aB.detach())
-        buf["logpA"].append(logpA.detach())
-        buf["logpB"].append(logpB.detach())
-        buf["vA"].append(vA.detach())
-        buf["vB"].append(vB.detach())
-        buf["rA"].append(rA)
-        buf["rB"].append(rB)
+        buf["zA_vec"].append(zA_vec)                                   # [n]
+        buf["zB_vec"].append(zB_vec)
+        buf["logp_zA"].append(pi_zA.log_prob(zA_vec_raw).mean())       # scalar
+        buf["logp_zB"].append(pi_zB.log_prob(zB_vec_raw).mean())       # scalar
+        buf["v_teamA"].append(v_tA.squeeze())                           # scalar
+        buf["v_teamB"].append(v_tB.squeeze())                           # scalar
+        buf["ent_zA"].append(pi_zA.entropy().squeeze())                # scalar
+        buf["ent_zB"].append(pi_zB.entropy().squeeze())                # scalar
+
+        # 유닛 (모델 출력, logp 모두 그래프 유지)
+        buf["ulogsA"].append(ulogitsA)                                  # [n,A]
+        buf["ulogsB"].append(ulogitsB)
+        buf["logpA"].append(piA.log_prob(aA))                           # [n]
+        buf["logpB"].append(piB.log_prob(aB))                           # [n]
+        buf["vA"].append(vA)                                            # [n]
+        buf["vB"].append(vB)                                            # [n]
+        buf["alphaA"].append(alphaA)                                    # [n]
+        buf["alphaB"].append(alphaB)                                    # [n]
+        buf["localA"].append(localA)                                    # [n,A]
+        buf["localB"].append(localB)
+        buf["priorA"].append(priorA)                                    # [n,A]
+        buf["priorB"].append(priorB)
+        buf["actA"].append(aA)                                          # [n] (정수, grad 불필요)
+        buf["actB"].append(aB)
+
+        # 보상/종료
+        buf["rA"].append(torch.tensor(rA, dtype=torch.float32, device=DEVICE))  # scalar
+        buf["rB"].append(torch.tensor(rB, dtype=torch.float32, device=DEVICE))  # scalar
         buf["done"].append(1.0 if done else 0.0)
 
-        team_obs_A, team_obs_B = nextA, nextB
         if done:
-            team_obs_A, team_obs_B = env.reset()
+            obsA, obsB = env.reset()
 
-    def cat(xs):
-        return torch.cat(xs, dim=0) if isinstance(xs[0], torch.Tensor) else torch.tensor(xs)
-
+    # === 스택/패킹 ===
+    def Stack(x): return torch.stack(x)
     T = len(buf["rA"])
-    roll = {
-        "obsA": torch.stack(buf["obsA"]).to(DEVICE),
-        "obsB": torch.stack(buf["obsB"]).to(DEVICE),
-        "zA": torch.tensor(buf["zA"], dtype=torch.long, device=DEVICE),
-        "zB": torch.tensor(buf["zB"], dtype=torch.long, device=DEVICE),
-        "uobsA": cat(buf["uobsA"]).to(DEVICE),
-        "uobsB": cat(buf["uobsB"]).to(DEVICE),
-        "uidA": cat(buf["uidA"]).to(DEVICE),
-        "uidB": cat(buf["uidB"]).to(DEVICE),
-        "actA": cat(buf["actA"]).long().to(DEVICE),
-        "actB": cat(buf["actB"]).long().to(DEVICE),
-        "vA": cat(buf["vA"]).to(DEVICE),
-        "vB": cat(buf["vB"]).to(DEVICE),
-        "rA": torch.tensor(buf["rA"], dtype=torch.float32, device=DEVICE),
-        "rB": torch.tensor(buf["rB"], dtype=torch.float32, device=DEVICE),
-        "done": torch.tensor(buf["done"], dtype=torch.float32, device=DEVICE),
-        "T": T
-    }
+    roll = dict(
+        T=T, n=n,
+        # 팀
+        obsA=Stack(buf["obsA"]),                    # [T, obs]
+        obsB=Stack(buf["obsB"]),
+        zA_vec=Stack(buf["zA_vec"]),                # [T, n]
+        zB_vec=Stack(buf["zB_vec"]),
+        logp_zA=Stack(buf["logp_zA"]),              # [T]
+        logp_zB=Stack(buf["logp_zB"]),              # [T]
+        v_teamA=Stack(buf["v_teamA"]),              # [T]
+        v_teamB=Stack(buf["v_teamB"]),              # [T]
+        ent_zA=Stack(buf["ent_zA"]),                # [T]
+        ent_zB=Stack(buf["ent_zB"]),                # [T]
+        # 유닛
+        ulogsA=Stack(buf["ulogsA"]),                # [T, n, A]
+        ulogsB=Stack(buf["ulogsB"]),                # [T, n, A]
+        logpA=Stack(buf["logpA"]),                  # [T, n]
+        logpB=Stack(buf["logpB"]),                  # [T, n]
+        vA=Stack(buf["vA"]),                        # [T, n]
+        vB=Stack(buf["vB"]),                        # [T, n]
+        alphaA=Stack(buf["alphaA"]),                # [T, n]
+        alphaB=Stack(buf["alphaB"]),                # [T, n]
+        localA=Stack(buf["localA"]),                # [T, n, A]
+        localB=Stack(buf["localB"]),                # [T, n, A]
+        priorA=Stack(buf["priorA"]),                # [T, n, A]
+        priorB=Stack(buf["priorB"]),                # [T, n, A]
+        actA=Stack(buf["actA"]),                    # [T, n]
+        actB=Stack(buf["actB"]),                    # [T, n]
+        # 리워드/종료
+        rA=Stack(buf["rA"]),                        # [T]
+        rB=Stack(buf["rB"]),                        # [T]
+        done=torch.tensor(buf["done"], dtype=torch.float32, device=DEVICE)  # [T]
+    )
     return roll
 
 
-def compute_advantages(roll, gamma=0.99, n_units=10):
-    T = roll["T"]
-    dones = roll["done"]
-
-    def returns(rews):
-        ret = torch.zeros_like(rews)
-        running = 0.0
-        for t in reversed(range(T)):
-            running = rews[t] + gamma * running * (1.0 - dones[t])
-            ret[t] = running
-        return ret
-
-    R_A = returns(roll["rA"])
-    R_B = returns(roll["rB"])
-
-    vA = roll["vA"].view(T, n_units)
-    vB = roll["vB"].view(T, n_units)
-    tgtA = R_A.unsqueeze(1).repeat(1, n_units)
-    tgtB = R_B.unsqueeze(1).repeat(1, n_units)
-
-    advA = (tgtA - vA).detach()
-    advB = (tgtB - vB).detach()
-    return advA.reshape(-1), tgtA.reshape(-1), advB.reshape(-1), tgtB.reshape(-1)
-
-
-def save_ckpt(path, team, unit, meta):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({"team": team.state_dict(), "unit": unit.state_dict(), "meta": meta}, path)
-
-
-# ----------------------------
-# Main
-# ----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=2000)
-    ap.add_argument("--horizon", type=int, default=128)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--width", type=int, default=24)
-    ap.add_argument("--height", type=int, default=24)
-    ap.add_argument("--n_per_team", type=int, default=10)
-    ap.add_argument("--max_steps", type=int, default=120)
-    ap.add_argument("--save_dir", type=str, default="ckpt")
-    ap.add_argument("--save_every", type=int, default=100)
-    # 탐험 스케줄
-    ap.add_argument("--eps0", type=float, default=0.20)
-    ap.add_argument("--eps_min", type=float, default=0.02)
-    ap.add_argument("--eps_decay", type=int, default=800)
+    ap.add_argument("--total-steps", type=int, default=200_000)
+    ap.add_argument("--horizon", type=int, default=256)
+    ap.add_argument("--num-tactics", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--gamma", type=float, default=0.99)
+    ap.add_argument("--save-every", type=int, default=5000)
+    ap.add_argument("--ckpt-dir", type=str, default="./ckpt")
+    ap.add_argument("--eps", type=float, default=0.05)
+    ap.add_argument("--temp", type=float, default=1.0)
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    env = CombatSelfPlay5v5Env(width=args.width, height=args.height,
-                               n_per_team=args.n_per_team, max_steps=args.max_steps,
-                               seed=args.seed, use_obstacles=True, obstacle_rate=0.06)
-
+    env = CombatSelfPlay5v5Env()
     obs_dim = env.get_team_obs_dim()
-    num_tactics = 4
-    action_dim = ACTION_NUM
     n_units = env.n
+    action_dim = ACTION_NUM
+    num_tactics = args.num_tactics
+    gamma = args.gamma
 
-    # A/B 독립 정책
     teamA = TeamTacticActorCritic(obs_dim, num_tactics).to(DEVICE)
-    unitA = UnitActorCritic(obs_dim, num_tactics, n_units, action_dim).to(DEVICE)
     teamB = TeamTacticActorCritic(obs_dim, num_tactics).to(DEVICE)
+    unitA = UnitActorCritic(obs_dim, num_tactics, n_units, action_dim).to(DEVICE)
     unitB = UnitActorCritic(obs_dim, num_tactics, n_units, action_dim).to(DEVICE)
 
-    opt_teamA = optim.Adam(teamA.parameters(), lr=3e-4)
-    opt_unitA = optim.Adam(unitA.parameters(), lr=3e-4)
-    opt_teamB = optim.Adam(teamB.parameters(), lr=3e-4)
-    opt_unitB = optim.Adam(unitB.parameters(), lr=3e-4)
+    opt_teamA = optim.Adam(teamA.parameters(), lr=args.lr)
+    opt_teamB = optim.Adam(teamB.parameters(), lr=args.lr)
+    opt_unitA = optim.Adam(unitA.parameters(), lr=args.lr)
+    opt_unitB = optim.Adam(unitB.parameters(), lr=args.lr)
 
+    ent_coef_team = 0.01
+    ent_coef_unit = 0.01
     vf_coef = 0.5
-    ent_coef_team = 0.05
-    ent_coef_unit = 0.02
-    max_grad_norm = 0.5
+    kl_coef = 0.02  # prior 정합 가중치(작게 시작)
 
-    for ep in range(1, args.epochs + 1):
-        # ε 스케줄
-        eps = max(args.eps_min, args.eps0 * (1.0 - (ep - 1) / max(1, args.eps_decay)))
-
+    step = 0
+    while step < args.total_steps:
         roll = rollout(env, teamA, unitA, teamB, unitB,
-                       horizon=args.horizon, num_tactics=num_tactics, eps=eps)
-        advA, tgtA, advB, tgtB = compute_advantages(roll, n_units=n_units)
+                       args.horizon, num_tactics, eps=args.eps, temp=args.temp)
+        T, n = roll["T"], roll["n"]
+        step += T
 
-        # --- Team losses (A/B 분리 계산) ---
-        logits_zA, v_teamA = teamA(roll["obsA"])
-        logits_zB, v_teamB = teamB(roll["obsB"])
-        pi_zA = Categorical(logits=logits_zA)
-        pi_zB = Categorical(logits=logits_zB)
-
+        # ===== 팀 레벨 리턴/손실 =====
         with torch.no_grad():
-            R_A_team = roll["rA"].flip(0).cumsum(0).flip(0)
-            R_B_team = roll["rB"].flip(0).cumsum(0).flip(0)
+            R_A_team = torch.zeros_like(roll["rA"])
+            R_B_team = torch.zeros_like(roll["rB"])
+            runA = 0.0; runB = 0.0
+            for t in reversed(range(T)):
+                runA = roll["rA"][t] + gamma * runA * (1.0 - roll["done"][t])
+                runB = roll["rB"][t] + gamma * runB * (1.0 - roll["done"][t])
+                R_A_team[t] = runA; R_B_team[t] = runB
 
-        logp_zA = pi_zA.log_prob(roll["zA"])
-        logp_zB = pi_zB.log_prob(roll["zB"])
+        ent_teamA = roll["ent_zA"].mean()
+        ent_teamB = roll["ent_zB"].mean()
 
-        ent_teamA = pi_zA.entropy().mean()
-        ent_teamB = pi_zB.entropy().mean()
-
-        loss_teamA = -(logp_zA * (R_A_team - v_teamA).detach()).mean() \
-                     + vf_coef * ((v_teamA - R_A_team) ** 2).mean() \
+        # Advantage는 target - value, policy-gradient는 logp * adv(target) (value는 detach X)
+        loss_teamA = -(roll["logp_zA"] * (R_A_team - roll["v_teamA"]).detach()).mean() \
+                     + vf_coef * ((roll["v_teamA"] - R_A_team)**2).mean() \
                      - ent_coef_team * ent_teamA
 
-        loss_teamB = -(logp_zB * (R_B_team - v_teamB).detach()).mean() \
-                     + vf_coef * ((v_teamB - R_B_team) ** 2).mean() \
+        loss_teamB = -(roll["logp_zB"] * (R_B_team - roll["v_teamB"]).detach()).mean() \
+                     + vf_coef * ((roll["v_teamB"] - R_B_team)**2).mean() \
                      - ent_coef_team * ent_teamB
 
-        # --- Unit losses (A/B 분리 계산) ---
-        zA_oh = torch.nn.functional.one_hot(roll["zA"], num_classes=num_tactics).float() \
-                    .unsqueeze(1).repeat(1, n_units, 1).reshape(-1, num_tactics)
-        zB_oh = torch.nn.functional.one_hot(roll["zB"], num_classes=num_tactics).float() \
-                    .unsqueeze(1).repeat(1, n_units, 1).reshape(-1, num_tactics)
+        # ===== 유닛 레벨 =====
+        def returns(rews, done):
+            ret = torch.zeros_like(rews); running = 0.0
+            for t in reversed(range(T)):
+                running = rews[t] + gamma * running * (1.0 - done[t])
+                ret[t] = running
+            return ret
 
-        logits_uA, vA = unitA(roll["uobsA"], zA_oh, roll["uidA"])
-        logits_uB, vB = unitB(roll["uobsB"], zB_oh, roll["uidB"])
-        pi_uA = Categorical(logits=logits_uA)
-        pi_uB = Categorical(logits=logits_uB)
+        R_A = returns(roll["rA"], roll["done"]).unsqueeze(1).repeat(1, n)  # [T,n]
+        R_B = returns(roll["rB"], roll["done"]).unsqueeze(1).repeat(1, n)  # [T,n]
 
-        ent_unitA = pi_uA.entropy().mean()
-        ent_unitB = pi_uB.entropy().mean()
+        vA = roll["vA"]                # [T,n]
+        vB = roll["vB"]                # [T,n]
+        advA = R_A - vA
+        advB = R_B - vB
 
-        loss_unitA = -(pi_uA.log_prob(roll["actA"]) * advA).mean() \
-                     + vf_coef * ((vA - tgtA) ** 2).mean() \
-                     - ent_coef_unit * ent_unitA
+        logpA = roll["logpA"]          # [T,n]
+        logpB = roll["logpB"]          # [T,n]
 
-        loss_unitB = -(pi_uB.log_prob(roll["actB"]) * advB).mean() \
-                     + vf_coef * ((vB - tgtB) ** 2).mean() \
-                     - ent_coef_unit * ent_unitB
+        # 엔트로피: 저장된 logits로 재계산 (그래프 유지)
+        ulogsA_flat = roll["ulogsA"].reshape(T*n, -1)
+        ulogsB_flat = roll["ulogsB"].reshape(T*n, -1)
+        entA = Categorical(logits=ulogsA_flat).entropy().mean()
+        entB = Categorical(logits=ulogsB_flat).entropy().mean()
 
-        # --- Optimize (A/B 각각 독립 그래프) ---
-        opt_teamA.zero_grad();  loss_teamA.backward();  nn.utils.clip_grad_norm_(teamA.parameters(), max_grad_norm);  opt_teamA.step()
-        opt_unitA.zero_grad();  loss_unitA.backward();  nn.utils.clip_grad_norm_(unitA.parameters(), max_grad_norm);  opt_unitA.step()
+        loss_unitA = -(logpA * advA.detach()).mean() + 0.5 * (advA**2).mean() - ent_coef_unit * entA
+        loss_unitB = -(logpB * advB.detach()).mean() + 0.5 * (advB**2).mean() - ent_coef_unit * entB
 
-        opt_teamB.zero_grad();  loss_teamB.backward();  nn.utils.clip_grad_norm_(teamB.parameters(), max_grad_norm);  opt_teamB.step()
-        opt_unitB.zero_grad();  loss_unitB.backward();  nn.utils.clip_grad_norm_(unitB.parameters(), max_grad_norm);  opt_unitB.step()
+        # prior 정합 KL (α 가중)
+        localA = roll["localA"].reshape(T*n, -1)
+        priorA = roll["priorA"].reshape(T*n, -1)
+        alphaA = roll["alphaA"].reshape(T*n)
 
-        if ep % 10 == 0:
-            print(f"ep {ep:4d} | A_reward={roll['rA'].sum().item():+.2f} | B_reward={roll['rB'].sum().item():+.2f} "
-                  f"| teamA_L={loss_teamA.item():.3f} unitA_L={loss_unitA.item():.3f}")
+        localB = roll["localB"].reshape(T*n, -1)
+        priorB = roll["priorB"].reshape(T*n, -1)
+        alphaB = roll["alphaB"].reshape(T*n)
 
-        # 엔트로피 점감(학습 진행에 따라 탐험 약화)
-        if ep in (300, 800):
-            ent_coef_team *= 0.5
-            ent_coef_unit *= 0.5
+        p_locA = F.softmax(localA, dim=-1)
+        p_priA = F.softmax(priorA, dim=-1)
+        p_locB = F.softmax(localB, dim=-1)
+        p_priB = F.softmax(priorB, dim=-1)
 
-        # 체크포인트 저장
-        if args.save_every > 0 and ep % args.save_every == 0:
-            meta = {"ep": ep, "width": env.width, "height": env.height,
-                    "n_per_team": env.n, "max_steps": env.max_steps}
-            save_ckpt(os.path.join(args.save_dir, f"A_ep{ep}.pt"), teamA, unitA, meta)
-            save_ckpt(os.path.join(args.save_dir, f"B_ep{ep}.pt"), teamB, unitB, meta)
+        klA = torch.sum(p_locA * (torch.log(p_locA + 1e-8) - torch.log(p_priA + 1e-8)), dim=-1)  # [T*n]
+        klB = torch.sum(p_locB * (torch.log(p_locB + 1e-8) - torch.log(p_priB + 1e-8)), dim=-1)
 
+        loss_unitA = loss_unitA + kl_coef * (alphaA * klA).mean()
+        loss_unitB = loss_unitB + kl_coef * (alphaB * klB).mean()
+
+        # ===== 최적화 =====
+        opt_teamA.zero_grad(); loss_teamA.backward(); opt_teamA.step()
+        opt_teamB.zero_grad(); loss_teamB.backward(); opt_teamB.step()
+        opt_unitA.zero_grad(); loss_unitA.backward(); opt_unitA.step()
+        opt_unitB.zero_grad(); loss_unitB.backward(); opt_unitB.step()
+
+        if step % args.save_every == 0:
+            torch.save({"team": teamA.state_dict()}, os.path.join(args.ckpt_dir, f"teamA_{step}.pt"))
+            torch.save({"team": teamB.state_dict()}, os.path.join(args.ckpt_dir, f"teamB_{step}.pt"))
+            torch.save({"unit": unitA.state_dict()}, os.path.join(args.ckpt_dir, f"unitA_{step}.pt"))
+            torch.save({"unit": unitB.state_dict()}, os.path.join(args.ckpt_dir, f"unitB_{step}.pt"))
+            print(f"[{step}] teamA={loss_teamA.item():.3f} teamB={loss_teamB.item():.3f} "
+                  f"unitA={loss_unitA.item():.3f} unitB={loss_unitB.item():.3f}")
 
 if __name__ == "__main__":
     main()
