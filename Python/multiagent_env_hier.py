@@ -1,339 +1,299 @@
 import numpy as np
-from commands import Command, onehot_cmd, N_COMMANDS
 
-class CombatHierEnv:
+# ====== 맵/유닛 파라미터(필요에 맞게 조절) ======
+MAP_W = 30
+MAP_H = 30
+MAX_STEPS = 300
+
+N_PER_TEAM = 5
+N_ACTIONS  = 6  # 0 stay, 1 up, 2 down, 3 left, 4 right, 5 shoot
+
+# ====== 보상 상수 (스케일 크게 / 방향성 소수점) ======
+REWARD_KILL          = +4.0
+REWARD_DEATH         = -4.0
+REWARD_HIT           = +0.5
+REWARD_CAPTURE       = +20.0
+REWARD_TIMEOUT_WIN   = +6.0
+REWARD_TIMEOUT_LOSS  = -6.0
+
+STEP_TOWARD_BASE     = +0.08
+STEP_AWAY_FROM_BASE  = -0.04
+STALL_PENALTY        = -0.02
+
+# 타임아웃 점수 가중
+ALIVE_WEIGHT     = 1.0
+PROGRESS_WEIGHT  = 0.03
+
+# 캡처 판정
+CAPTURE_RADIUS   = 1.5
+
+class CombatSelfPlayHierEnv:
     """
-    계층형 멀티에이전트 전투 환경.
-    - 유닛 행동: 0=stay,1=up,2=down,3=left,4=right,5=attack,6=regroup
-    - 지휘 명령: ATTACK, DEFEND, HOLD, FLANK_L, FLANK_R, RETREAT
-    - 관측:
-      * 팀 전역(지휘관): [my_units(x,y,hp,alive)*N, en_units(...)*N, base_me, base_en]  (정규화)
-      * 유닛 로컬(병사): [self(x,y,hp,alive), nearest Ally (dx,dy,dist), nearest Enemy (dx,dy,dist),
-                         local_adv, my_cooldowns, cmd_onehot]
-    - 보상:
-      * (가한피해 - 받은피해) + 승패 보너스
-      * 전술 셰이핑: 목표 진척(ATTACK/DEFEND/FLANK 등) + 위험 공격 패널티
+    간단화된 2D 격자 환경(자기대전). 
+    관측(obs_dim)= 11 (예시), 커맨더 1-hot은 모델 쪽에서 붙임.
     """
-    def __init__(
-        self,
-        n_per_team: int = 5,
-        arena_size: int = 16,
-        max_steps: int = 300,
-        move_cooldown: int = 0,
-        attack_cooldown: int = 3,
-        attack_range: float = 4.5,
-        attack_damage: float = 0.3,
-        win_bonus: float = 5.0,
-        shaping_lambda_progress: float = 0.02,
-        shaping_penalty_risky_attack: float = 0.05,
-        local_adv_radius: float = 4.5,
-        seed: int | None = None
-    ):
-        self.n = n_per_team
-        self.S = arena_size
-        self.max_steps = max_steps
-        self.move_cd_max = move_cooldown
-        self.atk_cd_max = attack_cooldown
-        self.atk_range = attack_range
-        self.atk_damage = attack_damage
-        self.win_bonus = win_bonus
-        self.sha_lam_prog = shaping_lambda_progress
-        self.sha_pen_risky = shaping_penalty_risky_attack
-        self.adv_R = local_adv_radius
+    def __init__(self, n_per_team=N_PER_TEAM, seed=123):
         self.rng = np.random.RandomState(seed)
+        self.n = n_per_team
+        self.n_actions = N_ACTIONS
+        self.obs_dim = 11  # 기본 특성 개수 (유닛 위치/벡터/체력/거리 등 구성했다고 가정)
+        self.MAX_STEPS = MAX_STEPS
+        self.reset()
 
-        self.t = 0
-        self._alloc()
+    # ---------------- 유틸 ----------------
+    def _rand_pos_in_box(self, x0, y0, x1, y1, k):
+        xs = self.rng.randint(x0, x1+1, size=k)
+        ys = self.rng.randint(y0, y1+1, size=k)
+        return np.stack([xs, ys], axis=1).astype(np.float32)
 
-    # ---------- helpers ----------
+    def _min_dist_to_enemy_base(self, pos_alive, nexus_xy):
+        if pos_alive.shape[0] == 0:
+            return 1e9
+        d = np.linalg.norm(pos_alive - nexus_xy[None, :], axis=1)
+        return float(np.min(d))
 
-    def _alloc(self):
-        N = self.n
-        self.posA = np.zeros((N, 2), dtype=np.float32)
-        self.posB = np.zeros((N, 2), dtype=np.float32)
-        self.hpA = np.ones((N,), dtype=np.float32)
-        self.hpB = np.ones((N,), dtype=np.float32)
-        self.aliveA = np.ones((N,), dtype=np.float32)
-        self.aliveB = np.ones((N,), dtype=np.float32)
-        self.move_cd_A = np.zeros((N,), dtype=np.int32)
-        self.move_cd_B = np.zeros((N,), dtype=np.int32)
-        self.atk_cd_A = np.zeros((N,), dtype=np.int32)
-        self.atk_cd_B = np.zeros((N,), dtype=np.int32)
-        self.baseA = 1.0
-        self.baseB = 1.0
-
-        # 지휘/집결 지점
-        self.cmdA = Command.ATTACK
-        self.cmdB = Command.DEFEND
-        self.rallyA = np.array([2, self.S//2], dtype=np.float32)
-        self.rallyB = np.array([self.S-3, self.S//2], dtype=np.float32)
-        self.attack_targetA = np.array([self.S-2, self.S//2], dtype=np.float32)
-        self.attack_targetB = np.array([1, self.S//2], dtype=np.float32)
-        self._prev_progress_A = 0.0
-        self._prev_progress_B = 0.0
-
-    def _spawn(self):
-        for i in range(self.n):
-            self.posA[i] = np.array([self.rng.randint(1, 3), self.rng.randint(2, self.S-2)], dtype=np.float32)
-            self.posB[i] = np.array([self.rng.randint(self.S-3, self.S-1), self.rng.randint(2, self.S-2)], dtype=np.float32)
-
-    def _normalize_pos(self, p):
-        return p / float(self.S - 1)
-
-    def _team_obs_for(self, side: str):
-        if side == "A":
-            me_pos, me_hp, me_alive = self.posA, self.hpA, self.aliveA
-            en_pos, en_hp, en_alive = self.posB, self.hpB, self.aliveB
-            base_me, base_en = self.baseA, self.baseB
+    def _team_timeout_score(self, side: str) -> float:
+        if side == 'A':
+            alive = int((self.hpA > 0).sum())
+            cur_min = self._min_dist_to_enemy_base(self.posA[self.hpA > 0], self.nexusB)
+            prog = max(0.0, float(self._start_minA_to_B - cur_min))
         else:
-            me_pos, me_hp, me_alive = self.posB, self.hpB, self.aliveB
-            en_pos, en_hp, en_alive = self.posA, self.hpA, self.aliveA
-            base_me, base_en = self.baseB, self.baseA
+            alive = int((self.hpB > 0).sum())
+            cur_min = self._min_dist_to_enemy_base(self.posB[self.hpB > 0], self.nexusA)
+            prog = max(0.0, float(self._start_minB_to_A - cur_min))
+        return ALIVE_WEIGHT * float(alive) + PROGRESS_WEIGHT * prog
 
-        me = []
-        for i in range(self.n):
-            me.append(self._normalize_pos(me_pos[i]))
-            me.append([me_hp[i], me_alive[i]])
-        me = np.concatenate(me, axis=0)
+    def _observe_team(self, team: str):
+        """
+        간단화를 위해 유닛별로 동일한 팀 전역 관측을 돌려준다(형상: (N, obs_dim)).
+        여기서는 예시로 [내 평균x, 평균y, 내 넥서스x,y, 적 넥서스x,y, 최소거리, 남은아군, 남은적군, step_norm, map_w, map_h]
+        """
+        if team == 'A':
+            my_pos = self.posA; my_hp = self.hpA
+            nx, ny = self.nexusB
+            ex_alive = int((self.hpB > 0).sum())
+            me_alive = int((self.hpA > 0).sum())
+            min_d = self._min_dist_to_enemy_base(my_pos[my_hp>0], self.nexusB)
+        else:
+            my_pos = self.posB; my_hp = self.hpB
+            nx, ny = self.nexusA
+            ex_alive = int((self.hpA > 0).sum())
+            me_alive = int((self.hpB > 0).sum())
+            min_d = self._min_dist_to_enemy_base(my_pos[my_hp>0], self.nexusA)
 
-        en = []
-        for i in range(self.n):
-            en.append(self._normalize_pos(en_pos[i]))
-            en.append([en_hp[i], en_alive[i]])
-        en = np.concatenate(en, axis=0)
+        if my_pos.shape[0] > 0:
+            meanx, meany = float(my_pos[:,0].mean()), float(my_pos[:,1].mean())
+        else:
+            meanx, meany = 0.0, 0.0
+        step_norm = self._step_count / float(self.MAX_STEPS)
 
-        obs = np.concatenate([me, en, np.array([base_me, base_en], dtype=np.float32)], axis=0)
-        return obs.astype(np.float32)
+        base = np.array([meanx, meany, 
+                         nx, ny, 
+                         self.nexusA[0], self.nexusA[1],
+                         min_d, me_alive, ex_alive, 
+                         step_norm, MAP_W], dtype=np.float32)
+        # obs_dim==11로 맞추기
+        # (마지막에 MAP_H 넣고 싶다면 obs_dim=12로 맞춰 모델/훈련 코드도 바꿔야 함)
+        out = np.tile(base[None, :], (self.n, 1))
+        return out
 
-    def _nearest(self, src, tgt, tgt_alive):
-        idx = np.where(tgt_alive > 0.5)[0]
-        if idx.size == 0:
-            return np.array([0,0], dtype=np.float32), 0.0, -1
-        diffs = tgt[idx] - src
-        d2 = np.sum(diffs*diffs, axis=1)
-        jloc = np.argmin(d2)
-        v = diffs[jloc]
-        d = float(np.sqrt(d2[jloc]))
-        return v, d, idx[jloc]
-
-    def _local_advantage(self, p, allies_pos, allies_hp, allies_alive, enemies_pos, enemies_hp, enemies_alive, R):
-        # 반경 R 내 체력합 차이
-        idxA = np.where(allies_alive > 0.5)[0]
-        idxE = np.where(enemies_alive > 0.5)[0]
-        a = 0.0; e = 0.0
-        for i in idxA:
-            if np.linalg.norm(allies_pos[i]-p) <= R:
-                a += float(allies_hp[i])
-        for j in idxE:
-            if np.linalg.norm(enemies_pos[j]-p) <= R:
-                e += float(enemies_hp[j])
-        return a - e  # >0 이면 우세
-
-    def _in_bounds(self, p):
-        p[0] = np.clip(p[0], 0, self.S-1)
-        p[1] = np.clip(p[1], 0, self.S-1)
-        return p
-
-    def _move_dirs(self, a):
-        dirs = {
-            1: np.array([0, -1], dtype=np.float32),
-            2: np.array([0,  1], dtype=np.float32),
-            3: np.array([-1, 0], dtype=np.float32),
-            4: np.array([1,  0], dtype=np.float32),
-        }
-        return dirs.get(int(a), None)
-
-    # ---------- public API ----------
-
+    # ---------------- API ----------------
     def reset(self):
-        self._alloc()
-        self._spawn()
-        self.t = 0
-        self._prev_progress_A = self._progress("A")
-        self._prev_progress_B = self._progress("B")
-        return self._team_obs_for("A"), self._team_obs_for("B")
+        # 시작 위치: A=좌하(7시), B=우상(1시)
+        self.nexusA = np.array([2.0, 2.0], dtype=np.float32)
+        self.nexusB = np.array([MAP_W-3.0, MAP_H-3.0], dtype=np.float32)
 
-    def unit_obs(self, side: str, i: int, cmd_onehot_vec):
-        if side == "A":
-            my_pos, my_hp, my_alive = self.posA, self.hpA, self.aliveA
-            al_pos, al_hp, al_alive = self.posA, self.hpA, self.aliveA
-            en_pos, en_hp, en_alive = self.posB, self.hpB, self.aliveB
-            move_cd, atk_cd = self.move_cd_A, self.atk_cd_A
-        else:
-            my_pos, my_hp, my_alive = self.posB, self.hpB, self.aliveB
-            al_pos, al_hp, al_alive = self.posB, self.hpB, self.aliveB
-            en_pos, en_hp, en_alive = self.posA, self.hpA, self.aliveA
-            move_cd, atk_cd = self.move_cd_B, self.atk_cd_B
+        self.posA = self._rand_pos_in_box(1, 1, 5, 5, self.n)
+        self.posB = self._rand_pos_in_box(MAP_W-6, MAP_H-6, MAP_W-2, MAP_H-2, self.n)
 
-        p = my_pos[i]
-        self_v_ally, self_d_ally, _ = self._nearest(p, al_pos, al_alive)
-        self_v_enemy, self_d_enemy, _ = self._nearest(p, en_pos, en_alive)
-        adv = self._local_advantage(p, al_pos, al_hp, al_alive, en_pos, en_hp, en_alive, self.adv_R)
+        self.hpA = np.ones((self.n,), dtype=np.int32) * 5
+        self.hpB = np.ones((self.n,), dtype=np.int32) * 5
 
-        obs = np.concatenate([
-            self._normalize_pos(p),                      # (2,)
-            np.array([my_hp[i], my_alive[i]], np.float32),  # (2,)
-            self_v_ally / max(1.0, self.adv_R),         # (2,)
-            np.array([self_d_ally / max(1.0, self.S)], np.float32),  # (1,)
-            self_v_enemy / max(1.0, self.adv_R),        # (2,)
-            np.array([self_d_enemy / max(1.0, self.S)], np.float32), # (1,)
-            np.array([adv], np.float32),                # (1,)
-            np.array([move_cd[i] / max(1, self.move_cd_max+1),
-                      atk_cd[i] / max(1, self.atk_cd_max+1)], np.float32),  # (2,)
-            cmd_onehot_vec.astype(np.float32)           # (N_COMMANDS,)
-        ], axis=0)
-        return obs.astype(np.float32)
+        self._step_count = 0
 
-    @property
-    def unit_obs_dim(self):
-        # 2(self pos) +2(hp,alive) +2+1(ally vec,dist) +2+1(enemy vec,dist) +1(adv) +2(cds) + N_COMMANDS
-        return 2+2 +3 +3 +1 +2 + N_COMMANDS
+        self._start_minA_to_B = self._min_dist_to_enemy_base(self.posA[self.hpA>0], self.nexusB)
+        self._start_minB_to_A = self._min_dist_to_enemy_base(self.posB[self.hpB>0], self.nexusA)
 
-    @property
-    def team_obs_dim(self):
-        # team-centric like before:  (x,y,hp,alive)*N *2 teams + 2 base scalars
-        return self.n*4*2 + 2
+        # 총알/샷 기록(유니티 시각화용)
+        self.bullets = []      # list of dict {x,y,vx,vy,life,team}
+        self.last_shots = []   # list of dict {team, fx,fy, tx,ty}
 
-    @property
-    def n_actions_unit(self):
-        return 7
+        obsA = self._observe_team('A')
+        obsB = self._observe_team('B')
+        return obsA, obsB
 
-    def _progress(self, side: str):
-        # ATTACK 관점의 전진 정도: 내 유닛들이 목표 방향으로 얼마나 가까운지(평균)
-        if side == "A":
-            tgt = self.attack_targetA
-            pos = self.posA
-            alive = self.aliveA
-        else:
-            tgt = self.attack_targetB
-            pos = self.posB
-            alive = self.aliveB
-        idx = np.where(alive > 0.5)[0]
-        if idx.size == 0: return 0.0
-        d = 0.0
-        for i in idx:
-            d += float(np.linalg.norm(pos[i]-tgt))
-        d /= idx.size
-        # 거리가 작을수록 좋은데, 보상을 +로 만들기 위해 음수부호
-        return -d
+    def step(self, aA: np.ndarray, aB: np.ndarray):
+        # --- 입력 안전 ---
+        aA = aA.astype(np.int64)
+        aB = aB.astype(np.int64)
 
-    def step(self, actA, actB):
-        self.t += 1
-        # movement
-        self._step_move_block(self.posA, self.aliveA, self.move_cd_A, actA, self.rallyA)
-        self._step_move_block(self.posB, self.aliveB, self.move_cd_B, actB, self.rallyB)
+        # --- 이전 최소거리 기록 (전진/후퇴 보상용) ---
+        prev_minA = self._min_dist_to_enemy_base(self.posA[self.hpA>0], self.nexusB)
+        prev_minB = self._min_dist_to_enemy_base(self.posB[self.hpB>0], self.nexusA)
 
-        # attack
-        dmgA_to_B, dmgB_to_A = self._step_attack_blocks(actA, actB)
+        # --- 이동/사격 처리 ---
+        self.last_shots = []
 
-        # base reward
-        rA = float(dmgA_to_B - dmgB_to_A)
-        rB = float(dmgB_to_A - dmgA_to_B)
+        def _apply_actions(pos, hp, act, team_char):
+            # 이동
+            for i in range(self.n):
+                if hp[i] <= 0: 
+                    continue
+                ai = int(act[i])
+                if ai == 1:   # up
+                    pos[i,1] = min(MAP_H-1, pos[i,1] + 1.0)
+                elif ai == 2: # down
+                    pos[i,1] = max(0.0, pos[i,1] - 1.0)
+                elif ai == 3: # left
+                    pos[i,0] = max(0.0, pos[i,0] - 1.0)
+                elif ai == 4: # right
+                    pos[i,0] = min(MAP_W-1, pos[i,0] + 1.0)
+                elif ai == 5: # shoot
+                    # 간단히: 상대 넥서스 방향으로 발사
+                    if team_char == 'A':
+                        tx, ty = self.nexusB
+                    else:
+                        tx, ty = self.nexusA
+                    fx, fy = pos[i,0], pos[i,1]
+                    vx, vy = (tx - fx), (ty - fy)
+                    n = np.linalg.norm([vx, vy]) + 1e-6
+                    vx /= n; vy /= n
+                    self.bullets.append({"x": fx, "y": fy, "vx": vx*2.0, "vy": vy*2.0, "life": 8, "team": team_char})
+                    self.last_shots.append({"team": team_char, "fx": fx, "fy": fy, "tx": tx, "ty": ty})
 
-        # shaping: progress
-        progA = self._progress("A")
-        progB = self._progress("B")
-        rA += self.sha_lam_prog * (progA - self._prev_progress_A)
-        rB += self.sha_lam_prog * (progB - self._prev_progress_B)
-        self._prev_progress_A, self._prev_progress_B = progA, progB
+        _apply_actions(self.posA, self.hpA, aA, 'A')
+        _apply_actions(self.posB, self.hpB, aB, 'B')
 
-        # risky attack penalty
-        rA -= self._risky_attack_penalty("A", actA)
-        rB -= self._risky_attack_penalty("B", actB)
+        # --- 총알 이동 & 피격 판정 ---
+        rA = np.zeros((self.n,), dtype=np.float32)
+        rB = np.zeros((self.n,), dtype=np.float32)
 
-        done, winner = self._terminal_and_winner()
-        if done and winner != "draw":
-            if winner == "A":
-                rA += self.win_bonus; rB -= self.win_bonus
-            elif winner == "B":
-                rB += self.win_bonus; rA -= self.win_bonus
+        new_bullets = []
+        for b in self.bullets:
+            if b["life"] <= 0: 
+                continue
+            b["x"] += b["vx"]
+            b["y"] += b["vy"]
+            b["life"] -= 1
+            if not (0 <= b["x"] < MAP_W and 0 <= b["y"] < MAP_H):
+                continue
+
+            # 피격: 반대팀만
+            if b["team"] == 'A':
+                tgt_pos, tgt_hp, rew_hit, rew_kill = self.posB, self.hpB, REWARD_HIT, REWARD_KILL
+                my_rew_arr = rA
+                opp_char = 'B'
+            else:
+                tgt_pos, tgt_hp, rew_hit, rew_kill = self.posA, self.hpA, REWARD_HIT, REWARD_KILL
+                my_rew_arr = rB
+                opp_char = 'A'
+
+            # 단순 근접 판정
+            hit_idx = None
+            for i in range(self.n):
+                if tgt_hp[i] <= 0: 
+                    continue
+                d = np.hypot(tgt_pos[i,0]-b["x"], tgt_pos[i,1]-b["y"])
+                if d < 0.7:
+                    hit_idx = i
+                    break
+            if hit_idx is not None:
+                # 히트
+                my_rew_arr += rew_hit / self.n  # 팀 분배(원하면 조정)
+                tgt_hp[hit_idx] -= 1
+                if tgt_hp[hit_idx] <= 0:
+                    # 킬
+                    my_rew_arr += rew_kill / self.n
+                    if opp_char == 'A':
+                        rA += REWARD_DEATH / self.n
+                    else:
+                        rB += REWARD_DEATH / self.n
+                continue
+
+            new_bullets.append(b)
+
+        self.bullets = new_bullets
+
+        # --- 전진/후퇴/교착 보상(팀 합산으로 적용) ---
+        cur_minA = self._min_dist_to_enemy_base(self.posA[self.hpA>0], self.nexusB)
+        cur_minB = self._min_dist_to_enemy_base(self.posB[self.hpB>0], self.nexusA)
+
+        progA = prev_minA - cur_minA
+        progB = prev_minB - cur_minB
+
+        if progA > 0: rA += STEP_TOWARD_BASE
+        elif progA < 0: rA += STEP_AWAY_FROM_BASE
+
+        if progB > 0: rB += STEP_TOWARD_BASE
+        elif progB < 0: rB += STEP_AWAY_FROM_BASE
+
+        if abs(progA) < 1e-3 and abs(progB) < 1e-3:
+            rA += STALL_PENALTY
+            rB += STALL_PENALTY
+
+        # --- 캡처 즉시 종료 체크 ---
+        def _captured(pos, hp, nexus):
+            if (hp > 0).any():
+                d = np.min(np.linalg.norm(pos[hp > 0] - nexus[None, :], axis=1))
+                return d <= CAPTURE_RADIUS
+            return False
+
+        done = False
+        winner = None
+
+        if _captured(self.posA, self.hpA, self.nexusB):
+            done = True; winner = 'A'; rA += REWARD_CAPTURE; rB -= REWARD_CAPTURE/2
+        elif _captured(self.posB, self.hpB, self.nexusA):
+            done = True; winner = 'B'; rB += REWARD_CAPTURE; rA -= REWARD_CAPTURE/2
+
+        # --- 전멸 ---
+        if not done:
+            aliveA = int((self.hpA > 0).sum())
+            aliveB = int((self.hpB > 0).sum())
+            if aliveA == 0 and aliveB == 0:
+                done = True
+                scoreA = self._team_timeout_score('A')
+                scoreB = self._team_timeout_score('B')
+                winner = 'A' if scoreA >= scoreB else 'B'
+            elif aliveA == 0:
+                done = True; winner = 'B'
+            elif aliveB == 0:
+                done = True; winner = 'A'
+
+        # --- 타임아웃 ---
+        self._step_count += 1
+        if not done and self._step_count >= self.MAX_STEPS:
+            scoreA = self._team_timeout_score('A')
+            scoreB = self._team_timeout_score('B')
+            done = True
+            if scoreA > scoreB:
+                winner = 'A'; rA += REWARD_TIMEOUT_WIN; rB += REWARD_TIMEOUT_LOSS
+            elif scoreB > scoreA:
+                winner = 'B'; rB += REWARD_TIMEOUT_WIN; rA += REWARD_TIMEOUT_LOSS
+            else:
+                # 동점 타이브레이커: 현재 최소거리
+                curA = self._min_dist_to_enemy_base(self.posA[self.hpA>0], self.nexusB)
+                curB = self._min_dist_to_enemy_base(self.posB[self.hpB>0], self.nexusA)
+                if curA <= curB:
+                    winner = 'A'; rA += REWARD_TIMEOUT_WIN; rB += REWARD_TIMEOUT_LOSS
+                else:
+                    winner = 'B'; rB += REWARD_TIMEOUT_WIN; rA += REWARD_TIMEOUT_LOSS
+
+        # ---- 관측/리턴 ----
+        obsA = self._observe_team('A')
+        obsB = self._observe_team('B')
 
         info = {
-            "aliveA": self.aliveA.copy(),
-            "aliveB": self.aliveB.copy(),
-            "winner": winner if done else None
+            "step": int(self._step_count),
+            "winner": winner,  # ★ 항상 'A' 또는 'B'
+            "aliveA": (self.hpA > 0).astype(np.int32),
+            "aliveB": (self.hpB > 0).astype(np.int32),
+            "nexusA": self.nexusA.copy(),
+            "nexusB": self.nexusB.copy(),
+            "posA": self.posA.copy(),
+            "posB": self.posB.copy(),
+            "bullets": np.array([[b["x"], b["y"]] for b in self.bullets], dtype=np.float32),
+            "shots": self.last_shots[:]  # 리스트(유니티 직렬화용)
         }
-        return self._team_obs_for("A"), self._team_obs_for("B"), rA, rB, done, info
 
-    def _step_move_block(self, pos, alive, move_cd, actions, rally_point):
-        for i in range(self.n):
-            if alive[i] <= 0.5: continue
-            if move_cd[i] > 0:
-                move_cd[i] -= 1
-                continue
-            a = int(actions[i])
-            if a == 6:  # regroup
-                v = rally_point - pos[i]
-                if np.linalg.norm(v) > 1e-6:
-                    v = v / np.linalg.norm(v)
-                pos[i] = self._in_bounds(pos[i] + v)
-                if self.move_cd_max > 0: move_cd[i] = self.move_cd_max
-                continue
-            d = self._move_dirs(a)
-            if d is not None:
-                pos[i] = self._in_bounds(pos[i] + d)
-                if self.move_cd_max > 0: move_cd[i] = self.move_cd_max
-
-    def _step_attack_blocks(self, actA, actB):
-        dmgA_to_B = self._attack_side(self.posA, self.aliveA, self.hpA, self.atk_cd_A,
-                                      self.posB, self.aliveB, self.hpB, actA)
-        dmgB_to_A = self._attack_side(self.posB, self.aliveB, self.hpB, self.atk_cd_B,
-                                      self.posA, self.aliveA, self.hpA, actB)
-        return dmgA_to_B, dmgB_to_A
-
-    def _attack_side(self, my_pos, my_alive, my_hp, my_atk_cd, en_pos, en_alive, en_hp, actions):
-        dmg = 0.0
-        for i in range(self.n):
-            if my_alive[i] <= 0.5: continue
-            if my_atk_cd[i] > 0:
-                my_atk_cd[i] -= 1
-                continue
-            if int(actions[i]) != 5:  # attack
-                continue
-            idx = np.where(en_alive > 0.5)[0]
-            if idx.size == 0: continue
-            diffs = en_pos[idx] - my_pos[i]
-            d2 = np.sum(diffs*diffs, axis=1)
-            jloc = np.argmin(d2)
-            dist = float(np.sqrt(d2[jloc]))
-            if dist <= self.atk_range:
-                j = idx[jloc]
-                en_hp[j] -= self.atk_damage
-                dmg += self.atk_damage
-                my_atk_cd[i] = self.atk_cd_max
-        # clamp & alive update
-        en_hp[:] = np.clip(en_hp, 0.0, 1.0)
-        for i in range(self.n):
-            if en_hp[i] <= 0.0: en_alive[i] = 0.0
-            if my_hp[i] <= 0.0: my_alive[i] = 0.0
-        return dmg
-
-    def _risky_attack_penalty(self, side: str, actions):
-        if side == "A":
-            my_pos, my_hp, my_alive = self.posA, self.hpA, self.aliveA
-            al_pos, al_hp, al_alive = self.posA, self.hpA, self.aliveA
-            en_pos, en_hp, en_alive = self.posB, self.hpB, self.aliveB
-        else:
-            my_pos, my_hp, my_alive = self.posB, self.hpB, self.aliveB
-            al_pos, al_hp, al_alive = self.posB, self.hpB, self.aliveB
-            en_pos, en_hp, en_alive = self.posA, self.hpA, self.aliveA
-        pen = 0.0
-        for i in range(self.n):
-            if my_alive[i] <= 0.5: continue
-            if int(actions[i]) == 5:  # attack
-                adv = self._local_advantage(my_pos[i], al_pos, al_hp, al_alive, en_pos, en_hp, en_alive, self.adv_R)
-                if adv < 0.0:
-                    pen += self.sha_pen_risky
-        return pen
-
-    def _terminal_and_winner(self):
-        a_alive = int(np.sum(self.aliveA > 0.5))
-        b_alive = int(np.sum(self.aliveB > 0.5))
-        if a_alive == 0 and b_alive == 0: return True, "draw"
-        if a_alive == 0: return True, "B"
-        if b_alive == 0: return True, "A"
-        if self.t >= self.max_steps:
-            sA = float(np.sum(self.hpA)); sB = float(np.sum(self.hpB))
-            if abs(sA - sB) < 1e-6: return True, "draw"
-            return True, "A" if sA > sB else "B"
-        return False, None
+        return obsA, obsB, rA, rB, done, info

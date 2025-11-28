@@ -1,100 +1,100 @@
 import argparse, json, socket, time
-import torch
 import numpy as np
-
-from commands import onehot_cmd, N_COMMANDS, Command
-from ac_models import CommanderPolicy, UnitPolicy, TeamValueNet
-from multiagent_env_hier import CombatHierEnv
+import torch
+from multiagent_env_hier import CombatSelfPlayHierEnv
+from ac_models import UnitActorCritic, CommanderActorCritic
+from commands import N_COMMANDS, onehot_cmd
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def pack_frame(env, step, info, rA, rB, cmdA_id, cmdB_id):
-    def team_units(pos, hp, alive):
-        return [
-            {"x": float(pos[i][0]), "y": float(pos[i][1]),
-             "hp": float(hp[i]), "alive": bool(alive[i] > 0.5)}
-            for i in range(env.n)
-        ]
-    return {
-        "step": step,
-        "arena_size": env.S,
-        "teamA": team_units(env.posA, env.hpA, env.aliveA),
-        "teamB": team_units(env.posB, env.hpB, env.aliveB),
-        "reward": {"A": float(rA), "B": float(rB)},
-        "cmdA": int(cmdA_id),
-        "cmdB": int(cmdB_id),
-        "winner": info.get("winner"),
-        "done": info.get("winner") is not None
+def send_frame(sock, addr, env, info):
+    # Unity 쪽 FrameModels.cs 기준에 맞춰 최대한 보편 필드 구성
+    frame = {
+        "nexusA": {"x": float(info["nexusA"][0]), "y": float(info["nexusA"][1])},
+        "nexusB": {"x": float(info["nexusB"][0]), "y": float(info["nexusB"][1])},
+        "unitsA": [{"x": float(env.posA[i,0]), "y": float(env.posA[i,1]), "hp": int(env.hpA[i])} for i in range(env.n)],
+        "unitsB": [{"x": float(env.posB[i,0]), "y": float(env.posB[i,1]), "hp": int(env.hpB[i])} for i in range(env.n)],
+        "bullets": [{"x": float(b[0]), "y": float(b[1])} for b in (info.get("bullets") or np.zeros((0,2),dtype=np.float32))],
+        "shots":   info.get("shots", []),
+        "step": int(info.get("step", 0))
     }
+    buf = (json.dumps(frame) + "\n").encode("utf-8")
+    sock.sendto(buf, addr)
 
-def eval_stream(model_path: str | None, host: str, port: int, fps: int, episodes: int, K_cmd: int = 8):
-    env = CombatHierEnv(n_per_team=5, seed=123)
-    unit_pi = UnitPolicy(env.unit_obs_dim, env.n_actions_unit, hidden=256).to(device)
-    vnet = TeamValueNet(env.team_obs_dim, hidden=256).to(device)
-    cmdA = CommanderPolicy(env.team_obs_dim, N_COMMANDS, hidden=256).to(device)
-    cmdB = CommanderPolicy(env.team_obs_dim, N_COMMANDS, hidden=256).to(device)
+@torch.no_grad()
+def greedy_action(model, obs_np):
+    t = torch.from_numpy(obs_np).float().to(device)
+    logits, _ = model(t)
+    p = torch.softmax(logits, dim=-1)
+    a = torch.argmax(p, dim=-1).cpu().numpy()
+    return a
 
-    if model_path:
-        sd = torch.load(model_path, map_location=device)
-        unit_pi.load_state_dict(sd["unit_pi"])
-        vnet.load_state_dict(sd["vnet"])
-        cmdA.load_state_dict(sd["cmdA"])
-        cmdB.load_state_dict(sd["cmdB"])
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--modelA", required=True)
+    ap.add_argument("--modelB", required=True)
+    ap.add_argument("--cmdA", required=True)
+    ap.add_argument("--cmdB", required=True)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=7788)
+    ap.add_argument("--fps", type=int, default=10)
+    ap.add_argument("--episodes", type=int, default=10)
+    ap.add_argument("--cmd_interval", type=int, default=8)
+    args = ap.parse_args()
 
-    unit_pi.eval(); vnet.eval(); cmdA.eval(); cmdB.eval()
+    env = CombatSelfPlayHierEnv(n_per_team=5, seed=123)
+    obs_total = env.obs_dim + N_COMMANDS
+
+    unitA = UnitActorCritic(obs_total, env.n_actions, hidden=256).to(device)
+    unitB = UnitActorCritic(obs_total, env.n_actions, hidden=256).to(device)
+    cmdA  = CommanderActorCritic(env.obs_dim, N_COMMANDS, hidden=256).to(device)
+    cmdB  = CommanderActorCritic(env.obs_dim, N_COMMANDS, hidden=256).to(device)
+
+    unitA.load_state_dict(torch.load(args.modelA, map_location=device))
+    unitB.load_state_dict(torch.load(args.modelB, map_location=device))
+    cmdA.load_state_dict(torch.load(args.cmdA, map_location=device))
+    cmdB.load_state_dict(torch.load(args.cmdB, map_location=device))
+
+    unitA.eval(); unitB.eval(); cmdA.eval(); cmdB.eval()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    addr = (host, port)
-    dt = 1.0/max(1,fps)
+    addr = (args.host, args.port)
+    dt = 1.0 / max(1, args.fps)
 
-    for ep in range(episodes):
-        oA_team, oB_team = env.reset()
+    for ep in range(args.episodes):
+        obsA, obsB = env.reset()
+        cur_cmdA, cur_cmdB = 0, 1
         done = False; step = 0
-        curr_cmdA = Command.ATTACK; curr_cmdB = Command.DEFEND
+        last_send = 0.0
 
-        while not done and step < 2000:
-            t0 = time.time()
+        while not done and step < env.MAX_STEPS:
+            # 커맨더 갱신
+            if step % args.cmd_interval == 0:
+                oA_cmd = obsA[0:1]
+                oB_cmd = obsB[0:1]
+                cur_cmdA = int(greedy_action(cmdA, oA_cmd)[0])
+                cur_cmdB = int(greedy_action(cmdB, oB_cmd)[0])
+
+            ohA = onehot_cmd(cur_cmdA)
+            ohB = onehot_cmd(cur_cmdB)
+
+            obsA_17 = np.concatenate([obsA, np.tile(ohA[None,:], (env.n,1))], axis=1)
+            obsB_17 = np.concatenate([obsB, np.tile(ohB[None,:], (env.n,1))], axis=1)
+
+            aA = greedy_action(unitA, obsA_17)
+            aB = greedy_action(unitB, obsB_17)
+
+            obsA, obsB, rA, rB, done, info = env.step(aA, aB)
+
+            now = time.time()
+            if now - last_send >= dt:
+                send_frame(sock, addr, env, info)
+                last_send = now
+
             step += 1
 
-            oA_t = torch.from_numpy(oA_team).float().to(device)
-            oB_t = torch.from_numpy(oB_team).float().to(device)
-
-            if (step-1) % K_cmd == 0:
-                # greedy command
-                logitsA, _ = cmdA(oA_t); cA = torch.argmax(torch.softmax(logitsA, dim=-1)).item()
-                logitsB, _ = cmdB(oB_t); cB = torch.argmax(torch.softmax(logitsB, dim=-1)).item()
-                curr_cmdA, curr_cmdB = cA, cB
-
-            aA = np.zeros((env.n,), dtype=np.int64)
-            aB = np.zeros((env.n,), dtype=np.int64)
-
-            cA_one = onehot_cmd(curr_cmdA)
-            cB_one = onehot_cmd(curr_cmdB)
-
-            # greedy per-unit
-            for i in range(env.n):
-                uA = torch.from_numpy(env.unit_obs("A", i, cA_one)).float().to(device)
-                uB = torch.from_numpy(env.unit_obs("B", i, cB_one)).float().to(device)
-                aA[i] = int(torch.argmax(torch.softmax(unit_pi(uA), dim=-1)).item())
-                aB[i] = int(torch.argmax(torch.softmax(unit_pi(uB), dim=-1)).item())
-
-            oA_team, oB_team, rA, rB, done, info = env.step(aA, aB)
-
-            payload = pack_frame(env, step, info, rA, rB, curr_cmdA, curr_cmdB)
-            sock.sendto(json.dumps(payload).encode("utf-8"), addr)
-
-            el = time.time()-t0
-            if el < dt: time.sleep(dt-el)
-
-        print(f"[EP {ep+1}] winner={info.get('winner')}  alive A={int(info['aliveA'].sum())} B={int(info['aliveB'].sum())}")
+        w = info.get("winner", "A")  # 환경에서 반드시 A/B를 보장하지만 안전장치
+        print(f"[EP {ep+1}] winner={w}  alive A={(env.hpA>0).sum()} B={(env.hpB>0).sum()}")
 
 if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--model", type=str, default=None, help="ckpt/hier_XXXX.pt")
-    p.add_argument("--host", type=str, default="127.0.0.1")
-    p.add_argument("--port", type=int, default=7788)
-    p.add_argument("--fps", type=int, default=10)
-    p.add_argument("--episodes", type=int, default=5)
-    args = p.parse_args()
-    eval_stream(args.model, args.host, args.port, args.fps, args.episodes)
+    main()

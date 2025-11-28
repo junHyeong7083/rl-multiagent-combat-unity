@@ -2,9 +2,9 @@ from enum import IntEnum
 import numpy as np
 
 class Command(IntEnum):
-    ATTACK = 0
-    DEFEND = 1
-    HOLD = 2
+    ATTACK  = 0
+    DEFEND  = 1
+    HOLD    = 2
     FLANK_L = 3
     FLANK_R = 4
     RETREAT = 5

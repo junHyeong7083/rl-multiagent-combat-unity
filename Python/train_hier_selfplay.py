@@ -1,250 +1,227 @@
-import os
+import os, random
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 import torch.optim as optim
 
-from commands import Command, onehot_cmd, N_COMMANDS
-from ac_models import CommanderPolicy, UnitPolicy, TeamValueNet
-from multiagent_env_hier import CombatHierEnv
+from multiagent_env_hier import CombatSelfPlayHierEnv
+from ac_models import UnitActorCritic, CommanderActorCritic
+from commands import Command, N_COMMANDS, onehot_cmd
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def masked_mean(x, mask, eps=1e-8):
-    num = (x * mask).sum()
-    den = mask.sum().clamp_min(eps)
-    return num / den
+# ----------------- 하이퍼파라미터 -----------------
+SEED          = 123
+N_PER_TEAM    = 5
+HORIZON       = 128
+GAMMA         = 0.98
+LR_UNIT       = 3e-4
+LR_CMD        = 3e-4
+VF_COEF       = 0.5
+ENT_COEF      = 0.01
+GRAD_CLIP     = 0.5
 
-def rollout(env, cmdA, cmdB, K_cmd, unit_pi, vnet, cmd_pi, horizon=128, gamma=0.99):
-    obsA_team, obsB_team = env.reset()
+EPOCHS        = 2000
+FREEZE_K      = 20
+SAVE_INT      = 50
+EVAL_INT      = 100
+CMD_INTERVAL  = 8
 
-    # buffers
-    # commander (decision at t%K==0)
-    cmd_logp_A, cmd_val_A, cmd_time_A = [], [], []
-    cmd_logp_B, cmd_val_B, cmd_time_B = [], [], []
+CKPT_DIR      = "./ckpt"
+os.makedirs(CKPT_DIR, exist_ok=True)
 
-    # unit-level
-    logpA_units, logpB_units = [], []
-    aliveA_buf, aliveB_buf = [], []
-    valA_team, valB_team = [], []
-    rewA, rewB, done_buf = [], [], []
-    obsA_team_buf, obsB_team_buf = [], []
+def discounted_returns(x, gamma=GAMMA):
+    out = np.zeros_like(x, dtype=np.float32)
+    run = 0.0
+    for t in reversed(range(len(x))):
+        run = x[t] + gamma * run
+        out[t] = run
+    return out
 
-    for t in range(horizon):
-        oA_team_t = torch.from_numpy(obsA_team).float().to(device)
-        oB_team_t = torch.from_numpy(obsB_team).float().to(device)
+@torch.no_grad()
+def policy_action(logits):
+    p = torch.softmax(logits, dim=-1)
+    a = torch.argmax(p, dim=-1)
+    return a
 
-        # commander decides every K steps
-        if t % K_cmd == 0:
-            logits_cmd_A, v_cmd_A = cmdA(oA_team_t); pA = torch.softmax(logits_cmd_A, dim=-1)
-            distA = torch.distributions.Categorical(probs=pA)
-            cA = distA.sample()
-            logp_cA = distA.log_prob(cA)
+def clone_state(model: nn.Module):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-            logits_cmd_B, v_cmd_B = cmdB(oB_team_t); pB = torch.softmax(logits_cmd_B, dim=-1)
-            distB = torch.distributions.Categorical(probs=pB)
-            cB = distB.sample()
-            logp_cB = distB.log_prob(cB)
+def load_state(model: nn.Module, sd):
+    model.load_state_dict(sd)
 
-            curr_cmdA = int(cA.item())
-            curr_cmdB = int(cB.item())
+def rollout(env: CombatSelfPlayHierEnv,
+            unitA: UnitActorCritic, unitB: UnitActorCritic,
+            cmdA: CommanderActorCritic, cmdB: CommanderActorCritic,
+            train_side: str, cmd_interval: int = CMD_INTERVAL):
 
-            cmd_logp_A.append(logp_cA); cmd_val_A.append(v_cmd_A); cmd_time_A.append(t)
-            cmd_logp_B.append(logp_cB); cmd_val_B.append(v_cmd_B); cmd_time_B.append(t)
-        # keep last command otherwise
-        cmdA_id = curr_cmdA
-        cmdB_id = curr_cmdB
+    obsA, obsB = env.reset()
+    T = HORIZON
 
-        # team value (baseline for unit policy)
-        vA = vnet(oA_team_t); vB = vnet(oB_team_t)
-        valA_team.append(vA); valB_team.append(vB)
-        obsA_team_buf.append(oA_team_t); obsB_team_buf.append(oB_team_t)
+    # 커맨더 상태
+    cur_cmdA = Command.ATTACK
+    cur_cmdB = Command.DEFEND
+    cmdA_hist, cmdB_hist = [], []
 
-        # per-unit actions
-        aA_np = np.zeros((env.n,), dtype=np.int64)
-        aB_np = np.zeros((env.n,), dtype=np.int64)
+    obsA_buf, obsB_buf = [], []
+    actA_buf, actB_buf = [], []
+    rA_buf, rB_buf     = [], []
+    done_buf           = []
 
-        cmdA_onehot = onehot_cmd(cmdA_id)
-        cmdB_onehot = onehot_cmd(cmdB_id)
+    for t in range(T):
+        # 커맨더 갱신
+        if t % cmd_interval == 0:
+            # 팀 평균 관측을 대표로 커맨더에 입력 (여기선 유닛 관측 첫개를 사용)
+            oA_cmd = torch.from_numpy(obsA[0:1]).float().to(device)
+            oB_cmd = torch.from_numpy(obsB[0:1]).float().to(device)
+            with torch.no_grad():
+                logitA, _ = cmdA(oA_cmd)
+                logitB, _ = cmdB(oB_cmd)
+                cur_cmdA = int(policy_action(logitA)[0].item())
+                cur_cmdB = int(policy_action(logitB)[0].item())
 
-        logpAu = []
-        logpBu = []
-        aliveA_now = []
-        aliveB_now = []
+        ohA = onehot_cmd(cur_cmdA)  # (6,)
+        ohB = onehot_cmd(cur_cmdB)
 
-        for i in range(env.n):
-            # side A
-            uoA = env.unit_obs("A", i, cmdA_onehot)
-            uoA_t = torch.from_numpy(uoA).float().to(device)
-            logitsA = unit_pi(uoA_t); pA_u = torch.softmax(logitsA, dim=-1)
-            dA_u = torch.distributions.Categorical(probs=pA_u)
-            aA = dA_u.sample(); logpAu.append(dA_u.log_prob(aA))
-            aA_np[i] = int(aA.item())
-            aliveA_now.append(float(uoA[1+1]))  # alive index: [pos(2), hp,alive]-> alive at idx=3 -> here 1+1? quick explicit:
-            # 정확히 하자: unit_obs에서 [pos2, hp, alive] 순서이므로 alive는 index 3.
-            aliveA_now[-1] = float(uoA[3])
+        # 유닛 입력: 각 유닛 관측에 커맨더 1-hot을 붙인다
+        obsA_17 = np.concatenate([obsA, np.tile(ohA[None, :], (env.n,1))], axis=1)
+        obsB_17 = np.concatenate([obsB, np.tile(ohB[None, :], (env.n,1))], axis=1)
 
-            # side B
-            uoB = env.unit_obs("B", i, cmdB_onehot)
-            uoB_t = torch.from_numpy(uoB).float().to(device)
-            logitsB = unit_pi(uoB_t); pB_u = torch.softmax(logitsB, dim=-1)
-            dB_u = torch.distributions.Categorical(probs=pB_u)
-            aB = dB_u.sample(); logpBu.append(dB_u.log_prob(aB))
-            aB_np[i] = int(aB.item())
-            aliveB_now.append(float(uoB[3]))
+        obsA_buf.append(obsA_17.copy())
+        obsB_buf.append(obsB_17.copy())
+        cmdA_hist.append(cur_cmdA)
+        cmdB_hist.append(cur_cmdB)
 
-        obsA_team_next, obsB_team_next, rA, rB, done, info = env.step(aA_np, aB_np)
+        # 유닛 행동
+        oA_t = torch.from_numpy(obsA_17).float().to(device)
+        oB_t = torch.from_numpy(obsB_17).float().to(device)
+        with torch.no_grad():
+            logitsA, _ = unitA(oA_t)
+            logitsB, _ = unitB(oB_t)
+            aA = policy_action(logitsA).cpu().numpy()
+            aB = policy_action(logitsB).cpu().numpy()
 
-        logpA_units.append(torch.stack(logpAu))  # [n]
-        logpB_units.append(torch.stack(logpBu))  # [n]
-        aliveA_buf.append(torch.tensor(aliveA_now, dtype=torch.float32, device=device))
-        aliveB_buf.append(torch.tensor(aliveB_now, dtype=torch.float32, device=device))
-        rewA.append(torch.tensor(rA, dtype=torch.float32, device=device))
-        rewB.append(torch.tensor(rB, dtype=torch.float32, device=device))
-        done_buf.append(torch.tensor(float(done), dtype=torch.float32, device=device))
+        actA_buf.append(aA.copy())
+        actB_buf.append(aB.copy())
 
-        obsA_team = obsA_team_next
-        obsB_team = obsB_team_next
+        obsA, obsB, rA, rB, done, info = env.step(aA, aB)
+
+        # 팀 보상은 합계로 스케일업
+        rA_buf.append(float(np.sum(rA)))
+        rB_buf.append(float(np.sum(rB)))
+        done_buf.append(done)
         if done:
             break
 
-    # returns
-    T = len(rewA)
-    retA = []; retB = []
-    RA = torch.tensor(0.0, device=device); RB = torch.tensor(0.0, device=device)
-    for t in reversed(range(T)):
-        RA = rewA[t] + 0.99 * RA * (1.0 - done_buf[t])
-        RB = rewB[t] + 0.99 * RB * (1.0 - done_buf[t])
-        retA.append(RA); retB.append(RB)
-    retA.reverse(); retB.reverse()
-
     data = {
-        "T": T,
-        "obsA_team": torch.stack(obsA_team_buf),
-        "obsB_team": torch.stack(obsB_team_buf),
-        "valA": torch.stack(valA_team),
-        "valB": torch.stack(valB_team),
-        "retA": torch.stack(retA),
-        "retB": torch.stack(retB),
-        "logpA_units": torch.stack(logpA_units),   # [T, n]
-        "logpB_units": torch.stack(logpB_units),   # [T, n]
-        "aliveA": torch.stack(aliveA_buf),         # [T, n]
-        "aliveB": torch.stack(aliveB_buf),         # [T, n]
-        "cmd_logp_A": cmd_logp_A,
-        "cmd_val_A": cmd_val_A,
-        "cmd_time_A": cmd_time_A,
-        "cmd_logp_B": cmd_logp_B,
-        "cmd_val_B": cmd_val_B,
-        "cmd_time_B": cmd_time_B,
-        "done": done_buf[-1].item() if T>0 else 1.0
+        "obsA": np.asarray(obsA_buf, dtype=np.float32),         # (T, N, D+6)
+        "obsB": np.asarray(obsB_buf, dtype=np.float32),
+        "actA": np.asarray(actA_buf, dtype=np.int64),           # (T, N)
+        "actB": np.asarray(actB_buf, dtype=np.int64),
+        "rA":   np.asarray(rA_buf, dtype=np.float32),           # (T,)
+        "rB":   np.asarray(rB_buf, dtype=np.float32),
+        "cmdA": np.asarray(cmdA_hist, dtype=np.int64),          # (T,)
+        "cmdB": np.asarray(cmdB_hist, dtype=np.int64),
+        "done": np.asarray(done_buf, dtype=np.bool_),
+        "final_info": info,
+        "steps": len(rA_buf),
     }
     return data
 
-def train():
-    env = CombatHierEnv(
-        n_per_team=5,
-        arena_size=16,
-        max_steps=300,
-        move_cooldown=0,
-        attack_cooldown=3,
-        attack_range=4.5,
-        attack_damage=0.3,
-        win_bonus=6.0,
-        seed=42
-    )
+def train_one_side(unit: UnitActorCritic, cmd: CommanderActorCritic,
+                   data, gamma=GAMMA):
+    # 유닛 손실
+    obs = torch.tensor(data["obs"], dtype=torch.float32, device=device)  # (T,N,D+6)
+    act = torch.tensor(data["act"], dtype=torch.int64,   device=device)  # (T,N)
+    rets= torch.tensor(discounted_returns(data["ret"], gamma), dtype=torch.float32, device=device)  # (T,)
 
-    K_cmd = 8  # 지휘관 명령 주기
-    unit_pi = UnitPolicy(env.unit_obs_dim, env.n_actions_unit, hidden=256).to(device)
-    vnet = TeamValueNet(env.team_obs_dim, hidden=256).to(device)
-    cmdA = CommanderPolicy(env.team_obs_dim, N_COMMANDS, hidden=256).to(device)
-    cmdB = CommanderPolicy(env.team_obs_dim, N_COMMANDS, hidden=256).to(device)
+    T, N, D = obs.shape
+    obs = obs.view(T*N, D)
+    act = act.view(T*N)
 
-    opt = optim.Adam(list(unit_pi.parameters()) + list(vnet.parameters())
-                     + list(cmdA.parameters()) + list(cmdB.parameters()),
-                     lr=3e-4)
+    logits, v_pred = unit(obs)
+    logp = torch.log_softmax(logits, dim=-1)
+    act_logp = logp[torch.arange(T*N), act]
 
-    max_epochs = 2000
-    horizon = 128
-    gamma = 0.99
-    ent_coef_units = 0.01
-    ent_coef_cmd = 0.005
-    vf_coef = 0.5
-    max_grad_norm = 0.5
+    v_tgt = rets[:, None].repeat(1, N).reshape(T*N)
+    adv   = (v_tgt - v_pred.detach())
 
-    os.makedirs("ckpt", exist_ok=True)
+    pi_loss = -(act_logp * adv).mean()
+    v_loss  = 0.5 * (v_pred - v_tgt).pow(2).mean()
+    ent     = -(logp * torch.exp(logp)).sum(dim=-1).mean()
+    unit_loss = pi_loss + VF_COEF * v_loss - ENT_COEF * ent
 
-    for ep in range(1, max_epochs+1):
-        unit_pi.train(); vnet.train(); cmdA.train(); cmdB.train()
+    # 커맨더 손실(에피소드 타임스텝당 1개)
+    # 커맨더 입력은 obs의 첫 유닛(대표)에서 커맨더 one-hot 제외한 앞단 D-6을 사용
+    D_total = D
+    D_base  = D_total - N_COMMANDS
+    obs_cmd = obs.view(T, N, D_total)[:,0,:D_base]                   # (T, D_base)
+    cmd_idx = torch.tensor(data["cmd"], dtype=torch.int64, device=device)  # (T,)
 
-        data = rollout(env, cmdA, cmdB, K_cmd, unit_pi, vnet, cmdA, horizon=horizon, gamma=gamma)
-        T = data["T"]
-        if T == 0: continue
+    logits_c, v_c = cmd(obs_cmd)
+    logp_c = torch.log_softmax(logits_c, dim=-1)
+    act_logp_c = logp_c[torch.arange(T), cmd_idx]
 
-        # team advantage (공유) -> unit policy에 사용
-        valA = data["valA"]; retA = data["retA"]; advA = retA - valA
-        valB = data["valB"]; retB = data["retB"]; advB = retB - valB
+    v_tgt_c = rets  # 같은 리턴 신호 공유
+    adv_c   = (v_tgt_c - v_c.detach())
 
-        advA_rep = advA.unsqueeze(-1).repeat(1, env.n)
-        advB_rep = advB.unsqueeze(-1).repeat(1, env.n)
+    pi_loss_c = -(act_logp_c * adv_c).mean()
+    v_loss_c  = 0.5 * (v_c - v_tgt_c).pow(2).mean()
+    ent_c     = -(logp_c * torch.exp(logp_c)).sum(dim=-1).mean()
+    cmd_loss  = pi_loss_c + VF_COEF * v_loss_c - ENT_COEF * ent_c
 
-        # unit policy loss (alive mask)
-        logpA_u = data["logpA_units"]; logpB_u = data["logpB_units"]
-        aliveA = data["aliveA"]; aliveB = data["aliveB"]
-        pi_loss_A = -masked_mean(logpA_u * advA_rep.detach(), aliveA)
-        pi_loss_B = -masked_mean(logpB_u * advB_rep.detach(), aliveB)
-        pi_loss = 0.5 * (pi_loss_A + pi_loss_B)
+    return unit_loss, cmd_loss
 
-        # unit entropy (approx: 평균 엔트로피 추정 위해 몇 스텝 샘플)
-        with torch.no_grad():
-            pass  # 간단화를 위해 생략 가능
-        ent_units = 0.0  # 필요시 rollout 중 probs 저장해 사용
+def main():
+    random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+    def mk_env(seed=None):
+        return CombatSelfPlayHierEnv(n_per_team=N_PER_TEAM, seed=(seed if seed is not None else np.random.randint(1<<31)))
+    env = mk_env(SEED)
 
-        # team value loss
-        v_loss = 0.5 * (F.mse_loss(valA, retA) + F.mse_loss(valB, retB))
+    obs_base = env.obs_dim
+    obs_total= obs_base + N_COMMANDS
 
-        # commander loss (K-step 시점들만)
-        cmd_loss_pi = torch.tensor(0.0, device=device)
-        cmd_loss_v = torch.tensor(0.0, device=device)
-        if len(data["cmd_time_A"])>0:
-            adv_cmdA = []
-            for t, v in zip(data["cmd_time_A"], data["cmd_val_A"]):
-                adv_cmdA.append((retA[t] - v).detach())
-            adv_cmdA = torch.stack(adv_cmdA)
-            logp_cmdA = torch.stack(data["cmd_logp_A"])
-            v_cmdA = torch.stack(data["cmd_val_A"])
-            cmd_loss_pi = cmd_loss_pi + (- (logp_cmdA * adv_cmdA).mean())
-            cmd_loss_v = cmd_loss_v + F.mse_loss(v_cmdA, torch.stack([retA[t] for t in data["cmd_time_A"]]))
+    unitA = UnitActorCritic(obs_total, env.n_actions, hidden=256).to(device)
+    unitB = UnitActorCritic(obs_total, env.n_actions, hidden=256).to(device)
+    cmdA  = CommanderActorCritic(obs_base, N_COMMANDS, hidden=256).to(device)
+    cmdB  = CommanderActorCritic(obs_base, N_COMMANDS, hidden=256).to(device)
 
-        if len(data["cmd_time_B"])>0:
-            adv_cmdB = []
-            for t, v in zip(data["cmd_time_B"], data["cmd_val_B"]):
-                adv_cmdB.append((retB[t] - v).detach())
-            adv_cmdB = torch.stack(adv_cmdB)
-            logp_cmdB = torch.stack(data["cmd_logp_B"])
-            v_cmdB = torch.stack(data["cmd_val_B"])
-            cmd_loss_pi = cmd_loss_pi + (- (logp_cmdB * adv_cmdB).mean())
-            cmd_loss_v = cmd_loss_v + F.mse_loss(v_cmdB, torch.stack([retB[t] for t in data["cmd_time_B"]]))
+    optA_u = optim.Adam(unitA.parameters(), lr=LR_UNIT)
+    optB_u = optim.Adam(unitB.parameters(), lr=LR_UNIT)
+    optA_c = optim.Adam(cmdA.parameters(),  lr=LR_CMD)
+    optB_c = optim.Adam(cmdB.parameters(),  lr=LR_CMD)
 
-        loss = pi_loss + vf_coef*v_loss + cmd_loss_pi + 0.5*cmd_loss_v - ent_coef_units*0.0 - ent_coef_cmd*0.0
+    for ep in range(1, EPOCHS+1):
+        train_A = ((ep // FREEZE_K) % 2 == 0)
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(unit_pi.parameters())+list(vnet.parameters())
-                                       +list(cmdA.parameters())+list(cmdB.parameters()), max_grad_norm)
-        opt.step()
+        if train_A:
+            unitB.eval(); cmdB.eval()
+            unitA.train(); cmdA.train()
+        else:
+            unitA.eval(); cmdA.eval()
+            unitB.train(); cmdB.train()
+
+        data = rollout(env, unitA, unitB, cmdA, cmdB, 'A' if train_A else 'B', CMD_INTERVAL)
+
+        if train_A:
+            pack = {"obs": data["obsA"], "act": data["actA"], "ret": data["rA"], "cmd": data["cmdA"]}
+            u_loss, c_loss = train_one_side(unitA, cmdA, pack)
+            optA_u.zero_grad(); u_loss.backward(); nn.utils.clip_grad_norm_(unitA.parameters(), GRAD_CLIP); optA_u.step()
+            optA_c.zero_grad(); c_loss.backward(); nn.utils.clip_grad_norm_(cmdA.parameters(),  GRAD_CLIP); optA_c.step()
+        else:
+            pack = {"obs": data["obsB"], "act": data["actB"], "ret": data["rB"], "cmd": data["cmdB"]}
+            u_loss, c_loss = train_one_side(unitB, cmdB, pack)
+            optB_u.zero_grad(); u_loss.backward(); nn.utils.clip_grad_norm_(unitB.parameters(), GRAD_CLIP); optB_u.step()
+            optB_c.zero_grad(); c_loss.backward(); nn.utils.clip_grad_norm_(cmdB.parameters(),  GRAD_CLIP); optB_c.step()
 
         if ep % 10 == 0:
-            print(f"ep {ep:04d} | loss={loss.item():.3f} | pi_units={pi_loss.item():.3f} v={v_loss.item():.3f} "
-                  f"| cmd_pi={cmd_loss_pi.item():.3f} cmd_v={cmd_loss_v.item():.3f} "
-                  f"| retA={float(retA[0]):.2f} retB={float(retB[0]):.2f}")
+            print(f"ep {ep:04d} | train={'A' if train_A else 'B'} | unit_loss={u_loss.item():.3f} | cmd_loss={c_loss.item():.3f} | retA={np.mean(data['rA']):.2f} retB={np.mean(data['rB']):.2f}")
 
-        if ep % 200 == 0:
-            torch.save({
-                "unit_pi": unit_pi.state_dict(),
-                "vnet": vnet.state_dict(),
-                "cmdA": cmdA.state_dict(),
-                "cmdB": cmdB.state_dict()
-            }, f"ckpt/hier_{ep}.pt")
+        if ep % SAVE_INT == 0:
+            torch.save(unitA.state_dict(), os.path.join(CKPT_DIR, f"a_unit_ep{ep:04d}.pt"))
+            torch.save(unitB.state_dict(), os.path.join(CKPT_DIR, f"b_unit_ep{ep:04d}.pt"))
+            torch.save(cmdA.state_dict(),  os.path.join(CKPT_DIR, f"a_cmd_ep{ep:04d}.pt"))
+            torch.save(cmdB.state_dict(),  os.path.join(CKPT_DIR, f"b_cmd_ep{ep:04d}.pt"))
 
 if __name__ == "__main__":
-    train()
+    main()
