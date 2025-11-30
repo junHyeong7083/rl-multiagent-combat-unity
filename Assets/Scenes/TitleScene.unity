@@ -290,10 +290,12 @@ MonoBehaviour:
   loadingScene: LodingScene
   pythonPath: C:\Users\user\miniconda3\envs\rl_game_npc\python.exe
   streamerScript: RL_Game_NPC/unity_streamer.py
-  pythonArgs: --mode trained --model models_v3_20m/model_latest.pt --episodes 1000
-    --delay 0.1
+  pythonArgs: --mode asymmetric --model models_coop_v11/model_npc_final.pt --model-b
+    models_v11_10k_episodes/model_final.pt --random-player-idx --episodes 1000 --delay
+    0.1
   playerModeScript: RL_Game_NPC/player_mode_streamer.py
-  playerModeArgs: --model models_v3_20m/model_latest.pt --episodes 10 --delay 0.15
+  playerModeArgs: --model models_coop_v11/model_npc_final.pt --model-b models_v11_10k_episodes/model_final.pt
+    --episodes 10 --delay 0.15
   showGUI: 1
   backgroundColor: {r: 0.15, g: 0.15, b: 0.2, a: 1}
 --- !u!1 &891017598

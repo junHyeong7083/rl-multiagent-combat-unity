@@ -50,6 +50,9 @@ public class PlayerInputSender : MonoBehaviour
     private bool _playerAlive = true;
     public bool IsPlayerAlive => _playerAlive;
 
+    // 연결 실패 경고 한 번만 출력
+    private bool _connectionWarningShown = false;
+
     /// <summary>
     /// 플레이어 생존 상태 설정 (GameViewer에서 호출)
     /// </summary>
@@ -151,7 +154,12 @@ public class PlayerInputSender : MonoBehaviour
         catch (Exception e)
         {
             _connected = false;
-            Debug.LogWarning($"[PlayerInputSender] Connection failed: {e.Message}");
+            // 경고는 처음 한 번만 출력
+            if (!_connectionWarningShown)
+            {
+                Debug.LogWarning($"[PlayerInputSender] Connection failed: {e.Message}");
+                _connectionWarningShown = true;
+            }
         }
     }
 

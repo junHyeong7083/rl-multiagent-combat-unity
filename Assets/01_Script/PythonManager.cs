@@ -14,7 +14,7 @@ public class PythonManager : MonoBehaviour
     public bool IsRunning => PythonProcess != null && !PythonProcess.HasExited;
 
     [Header("Settings")]
-    public string mainMenuScene = "MainMenu";
+    public string mainMenuScene = "TitleScene";
     public KeyCode returnKey = KeyCode.Escape;
 
     private void Awake()

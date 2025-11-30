@@ -148,8 +148,8 @@ public class LoadingScene : MonoBehaviour
     {
         try
         {
-            // 기존 Python 프로세스 종료
-            KillExistingPythonProcesses();
+            // 기존 Python 프로세스 종료 (unity_streamer만 종료, 학습 프로세스는 유지)
+            KillExistingStreamerProcesses();
 
             // 프로젝트 루트 경로
             string projectRoot = Path.GetDirectoryName(Application.dataPath);
@@ -164,18 +164,19 @@ public class LoadingScene : MonoBehaviour
 
             string workingDir = Path.GetDirectoryName(scriptPath);
 
+            // cmd /k 를 사용해서 에러 발생 시에도 창이 유지되도록 함
             ProcessStartInfo startInfo = new ProcessStartInfo
             {
-                FileName = PythonPath,
-                Arguments = $"\"{scriptPath}\" {PythonArgs}",
+                FileName = "cmd.exe",
+                Arguments = $"/k \"\"{PythonPath}\" \"{scriptPath}\" {PythonArgs}\"",
                 WorkingDirectory = workingDir,
-                UseShellExecute = false,
-                CreateNoWindow = false,
-                RedirectStandardOutput = false,
-                RedirectStandardError = false
+                UseShellExecute = true,  // 콘솔 창 표시
+                CreateNoWindow = false
             };
 
-            UnityEngine.Debug.Log($"[LoadingScene] Starting Python: {PythonPath} \"{scriptPath}\" {PythonArgs}");
+            UnityEngine.Debug.Log($"[LoadingScene] WorkingDir: {workingDir}");
+            UnityEngine.Debug.Log($"[LoadingScene] PythonArgs: {PythonArgs}");
+            UnityEngine.Debug.Log($"[LoadingScene] Full command: cmd /k \"\"{PythonPath}\" \"{scriptPath}\" {PythonArgs}\"");
 
             _pythonProcess = Process.Start(startInfo);
 
@@ -211,6 +212,47 @@ public class LoadingScene : MonoBehaviour
             }
         }
         catch { }
+    }
+
+    /// <summary>
+    /// unity_streamer 또는 player_mode_streamer만 종료 (학습 프로세스는 유지)
+    /// </summary>
+    private void KillExistingStreamerProcesses()
+    {
+        try
+        {
+            Process[] pythonProcesses = Process.GetProcessesByName("python");
+            foreach (var proc in pythonProcesses)
+            {
+                try
+                {
+                    // 커맨드라인에 streamer가 포함된 프로세스만 종료
+                    string cmdLine = GetCommandLine(proc);
+                    if (cmdLine.Contains("unity_streamer") || cmdLine.Contains("player_mode_streamer"))
+                    {
+                        UnityEngine.Debug.Log($"[LoadingScene] Killing streamer process: {proc.Id}");
+                        proc.Kill();
+                        proc.WaitForExit(1000);
+                    }
+                    proc.Dispose();
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    private string GetCommandLine(Process proc)
+    {
+        try
+        {
+            // Windows에서 WMI 대신 간단히 MainModule 사용
+            return proc.MainModule?.FileName ?? "";
+        }
+        catch
+        {
+            return "";
+        }
     }
 
     private void EnsurePythonManager()

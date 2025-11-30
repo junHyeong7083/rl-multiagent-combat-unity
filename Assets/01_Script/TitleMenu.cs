@@ -21,12 +21,12 @@ public class TitleMenu : MonoBehaviour
     public string pythonPath = @"C:\Users\user\miniconda3\envs\rl_game_npc\python.exe";
     [Tooltip("unity_streamer.py 경로 (프로젝트 루트 기준)")]
     public string streamerScript = "RL_Game_NPC/unity_streamer.py";
-    [Tooltip("Python 실행 인자 (AI 관전 모드)")]
-    public string pythonArgs = "--mode trained --model models_v3_20m/model_latest.pt --episodes 1000 --delay 0.1";
+    [Tooltip("Python 실행 인자 (AI 관전 모드 - v11 협동 모델)")]
+    public string pythonArgs = "--mode asymmetric --model models_coop_v11/model_npc_final.pt --model-b models_v11_10k_episodes/model_final.pt --random-player-idx --episodes 1000 --delay 0.1";
     [Tooltip("플레이어 모드 스크립트")]
     public string playerModeScript = "RL_Game_NPC/player_mode_streamer.py";
-    [Tooltip("플레이어 모드 Python 인자")]
-    public string playerModeArgs = "--model models/model_latest.pt --episodes 10 --delay 0.15";
+    [Tooltip("플레이어 모드 Python 인자 (v11 협동 모델)")]
+    public string playerModeArgs = "--model models_coop_v11/model_npc_final.pt --model-b models_v11_10k_episodes/model_final.pt --episodes 10 --delay 0.15";
 
     [Header("UI Settings")]
     public bool showGUI = true;
