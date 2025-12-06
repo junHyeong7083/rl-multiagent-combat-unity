@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "C:\\Users\\user\\miniconda3\\envs\\rl_game_npc\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.defaultProfile.windows": "Command Prompt",
+    "terminal.integrated.env.windows": {
+        "PATH": "C:\\Users\\user\\miniconda3\\envs\\rl_game_npc;C:\\Users\\user\\miniconda3\\envs\\rl_game_npc\\Scripts;${env:PATH}"
+    }
+}
