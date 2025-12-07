@@ -163,14 +163,19 @@ python train.py --load-model models/model_latest.pt
 
 ### 2단계: 협동 NPC 학습
 
-1단계에서 학습된 모델을 플레이어 역할로 고정하고, NPC가 플레이어와 협동하도록 학습합니다.
+- **B팀 (적팀)**: 1단계 Self-Play 모델 고정
+- **A팀 탱커**: 플레이어 대리 역할 (3가지 정책 중 랜덤 선택으로 다양한 플레이 스타일 시뮬레이션)
+  - Goal: 적에게 돌진
+  - Model: 1단계 학습된 행동
+  - Conditional: 상황에 따라 전환
+- **A팀 나머지 4명**: 다양한 탱커 행동에 맞춰 협동하도록 학습
 
 ```bash
 # 협동 NPC 학습
 python train_coop_v11.py
 
-# 옵션 지정
-python train_coop_v11.py --total-steps 10000000 --opponent-model models/model_final.pt
+# 1단계 모델로 2단계 학습
+python train_coop_v11.py --opponent-model models/model_final.pt
 ```
 
 **주요 옵션:**
