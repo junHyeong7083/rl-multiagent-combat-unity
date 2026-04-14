@@ -40,11 +40,11 @@ class GameMap:
 
     def _generate_walls(self):
         """벽 생성"""
-        # 맵 가장자리는 벽으로 둘러싸기 (선택사항, 주석 처리)
-        # self.tiles[0, :] = TileType.WALL
-        # self.tiles[-1, :] = TileType.WALL
-        # self.tiles[:, 0] = TileType.WALL
-        # self.tiles[:, -1] = TileType.WALL
+        # 맵 가장자리는 벽으로 둘러싸기
+        self.tiles[0, :] = TileType.WALL
+        self.tiles[-1, :] = TileType.WALL
+        self.tiles[:, 0] = TileType.WALL
+        self.tiles[:, -1] = TileType.WALL
 
         # 중앙에 약간의 장애물 배치
         num_walls = int(self.width * self.height * self.config.wall_density)
