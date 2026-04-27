@@ -4,5 +4,7 @@
     "terminal.integrated.defaultProfile.windows": "Command Prompt",
     "terminal.integrated.env.windows": {
         "PATH": "C:\\Users\\user\\miniconda3\\envs\\rl_game_npc;C:\\Users\\user\\miniconda3\\envs\\rl_game_npc\\Scripts;${env:PATH}"
-    }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

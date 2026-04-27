@@ -26,6 +26,8 @@ namespace BossRaid
         [Header("Input")]
         [Tooltip("입력 샘플링 간격(초). Python 턴 간격보다 짧아야 함.")]
         public float sampleInterval = 0.1f;
+        [Tooltip("턴 기반 모드: 키 누를 때(GetKeyDown) 만 1회 전송. Python --turn-based 와 함께 사용.")]
+        public bool turnBased = false;
 
         private TcpClient _tcp;
         private NetworkStream _stream;
@@ -84,10 +86,22 @@ namespace BossRaid
 
         private int ReadInput()
         {
-            if (Input.GetKey(KeyCode.W)) return (int)BossActionId.MoveUp;
-            if (Input.GetKey(KeyCode.S)) return (int)BossActionId.MoveDown;
-            if (Input.GetKey(KeyCode.A)) return (int)BossActionId.MoveLeft;
-            if (Input.GetKey(KeyCode.D)) return (int)BossActionId.MoveRight;
+            // Unity 카메라 시점 기준: W/S 만 뒤집어서 화면 방향과 일치 (A/D 는 원래 맞음)
+            // turnBased = true 면 키 누를 때(Down) 만 1회. false 면 누르고 있는 동안 연속.
+            if (turnBased)
+            {
+                if (Input.GetKeyDown(KeyCode.W)) return (int)BossActionId.MoveDown;
+                if (Input.GetKeyDown(KeyCode.S)) return (int)BossActionId.MoveUp;
+                if (Input.GetKeyDown(KeyCode.A)) return (int)BossActionId.MoveLeft;
+                if (Input.GetKeyDown(KeyCode.D)) return (int)BossActionId.MoveRight;
+            }
+            else
+            {
+                if (Input.GetKey(KeyCode.W)) return (int)BossActionId.MoveDown;
+                if (Input.GetKey(KeyCode.S)) return (int)BossActionId.MoveUp;
+                if (Input.GetKey(KeyCode.A)) return (int)BossActionId.MoveLeft;
+                if (Input.GetKey(KeyCode.D)) return (int)BossActionId.MoveRight;
+            }
             if (Input.GetKeyDown(KeyCode.Space)) return (int)BossActionId.AttackBasic;
             if (Input.GetKeyDown(KeyCode.Q)) return (int)BossActionId.AttackSkill;
             return (int)BossActionId.Stay;

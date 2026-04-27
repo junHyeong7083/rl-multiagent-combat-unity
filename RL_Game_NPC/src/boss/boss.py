@@ -1,48 +1,39 @@
-"""보스 클래스 — FSM, 어그로, 스태거, 페이즈 관리"""
+"""보스 클래스 — FSM, 어그로, 스태거, 페이즈 (유클리드 연속 공간)"""
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
+import math
 import random
 
 from .config import BossConfig, PatternID, PhaseID
-from .patterns import ActiveTelegraph, BasePattern, PATTERN_REGISTRY, Pos
+from .patterns import ActiveTelegraph, BasePattern, PATTERN_REGISTRY, Pos, Shape
 
 
 @dataclass
 class Boss:
     config: BossConfig
-    x: int = 10
-    y: int = 10
+    x: float = 10.0
+    y: float = 10.0
     hp: int = 0
     phase: PhaseID = PhaseID.P1
-    invuln_turns: int = 0                # 페이즈 전이 직후 무적
-    grog_turns: int = 0                  # 스태거 성공 후 그로기
+    invuln_turns: int = 0
+    grog_turns: int = 0
     stagger_active: bool = False
     stagger_gauge: float = 0.0
 
-    # 어그로 테이블: unit_id -> 수치
     aggro: Dict[int, float] = field(default_factory=dict)
-
-    # 활성 텔레그래프
     telegraphs: List[ActiveTelegraph] = field(default_factory=list)
-
-    # 패턴 쿨타임 (pattern_id → 남은 턴)
     cooldowns: Dict[int, int] = field(default_factory=dict)
-
-    # 최근 사용 패턴 로그 (연속 사용 방지)
     recent_patterns: List[int] = field(default_factory=list)
 
-    # RNG
     rng: random.Random = field(default_factory=random.Random)
-
-    # 지속형 효과 — 저주 연결(활성 여부, 페어, 잔여 턴)
     active_chain: Optional[Dict] = None
 
     def __post_init__(self):
         if self.hp <= 0:
             self.hp = self.config.boss_max_hp
-        self.x = self.config.map_width // 2
-        self.y = self.config.map_height // 2
+        self.x = self.config.map_width / 2.0
+        self.y = self.config.map_height / 2.0
 
     # ─────────────────── 어그로 ───────────────────
 
@@ -61,7 +52,6 @@ class Boss:
     # ─────────────────── 페이즈 전이 ───────────────────
 
     def check_phase_transition(self) -> bool:
-        """HP 임계값 도달 시 다음 페이즈로. 전이 시 True 반환."""
         hp_ratio = self.hp / self.config.boss_max_hp
         th = self.config.phase_hp_thresholds
         new_phase = self.phase
@@ -72,10 +62,8 @@ class Boss:
         if new_phase != self.phase:
             self.phase = new_phase
             self.invuln_turns = self.config.phase_transition_invuln_turns
-            # 중앙 귀환
-            self.x = self.config.map_width // 2
-            self.y = self.config.map_height // 2
-            # 모든 텔레그래프 해제
+            self.x = self.config.map_width / 2.0
+            self.y = self.config.map_height / 2.0
             self.telegraphs.clear()
             return True
         return False
@@ -98,13 +86,10 @@ class Boss:
         for pid_int, w in weights.items():
             if w <= 0: continue
             if not self._can_use(pid_int): continue
-            # 동시 활성 2개 제한
             if len(self.telegraphs) >= self.config.max_active_telegraphs:
                 return None
-            # 같은 패턴 활성 중복 방지
             if any(t.pattern_id == PatternID(pid_int) for t in self.telegraphs):
                 continue
-            # 최근 3회 사용 패턴 가중치 절반
             penalty = 0.5 if pid_int in self.recent_patterns[-3:] else 1.0
             candidates.append(pid_int)
             probs.append(w * penalty)
@@ -121,12 +106,10 @@ class Boss:
 
     # ─────────────────── 텔레그래프 시작 ───────────────────
 
-    def start_pattern(
-        self,
-        pid: PatternID,
-        party_positions: Dict[int, Pos],
-        party_roles: Dict[int, int],
-    ):
+    def start_pattern(self, pid: PatternID,
+                      party_positions: Dict[int, Pos],
+                      party_roles: Dict[int, int],
+                      extra_override: Optional[Dict] = None):
         pat: BasePattern = PATTERN_REGISTRY[pid]
         scale = self.config.phase_cooldown_scale[int(self.phase)]
         self.cooldowns[int(pid)] = int(pat.cooldown * scale)
@@ -138,30 +121,67 @@ class Boss:
             "aggro_top_uid": self.top_aggro_uid() or 0,
             "roles": party_roles,
         }
-        tiles, targets = pat.select_tiles(
+        if extra_override:
+            extra.update(extra_override)
+        shapes, targets = pat.build_shapes(
             (self.x, self.y),
             party_positions,
-            self.config.map_width, self.config.map_height,
+            self.config,
             self.rng, extra,
         )
         tg = ActiveTelegraph(
             pattern_id=pid,
             turns_remaining=pat.wind_up_turns,
             total_wind_up=pat.wind_up_turns,
-            danger_tiles=tiles,
+            shapes=shapes,
             target_unit_ids=list(targets),
             extra={"damage": pat.base_damage},
         )
-        # 스태거는 시작 시 게이지 초기화
         if pid == PatternID.STAGGER:
             self.stagger_active = True
             self.stagger_gauge = self.config.stagger_gauge
+
+        # SEAL_BREAK: NPC ↔ spot 최적 배정 (총 이동거리 최소 + 보스 관통 경로 패널티)
+        if pid == PatternID.SEAL_BREAK:
+            from itertools import permutations
+            dealer_spot_idx = tg.target_unit_ids[0] if tg.target_unit_ids else -1
+            available = [i for i in range(len(tg.shapes)) if i != dealer_spot_idx]
+            npc_uids = sorted(uid for uid in party_positions
+                              if uid != self.config.player_slot)
+
+            def _path_blocked_by_boss(nx, ny, sx, sy):
+                """NPC → spot 직선 경로가 보스 원을 통과하는지 체크."""
+                dx = sx - nx; dy = sy - ny
+                seg2 = dx * dx + dy * dy
+                if seg2 < 1e-6:
+                    return False
+                t = max(0.0, min(1.0, ((self.x - nx) * dx + (self.y - ny) * dy) / seg2))
+                px = nx + t * dx; py = ny + t * dy
+                return math.hypot(self.x - px, self.y - py) < self.config.boss_radius + 0.3
+
+            def _cost(npc_uid, si):
+                px, py = party_positions[npc_uid]
+                sx = tg.shapes[si].params["cx"]
+                sy = tg.shapes[si].params["cy"]
+                d = math.hypot(px - sx, py - sy)
+                if _path_blocked_by_boss(px, py, sx, sy):
+                    d += 10.0  # 보스 관통 경로 강한 패널티
+                return d
+
+            # 3 NPC × 3 spot 모든 순열 중 총 비용 최소
+            best_perm, best_total = None, 1e18
+            for perm in permutations(available, len(npc_uids)):
+                total = sum(_cost(uid, si) for uid, si in zip(npc_uids, perm))
+                if total < best_total:
+                    best_total, best_perm = total, perm
+            assignments: Dict[int, int] = dict(zip(npc_uids, best_perm)) if best_perm else {}
+            tg.extra["npc_spots"] = assignments
+
         self.telegraphs.append(tg)
 
     # ─────────────────── 텔레그래프 틱 ───────────────────
 
     def tick_telegraphs(self) -> List[ActiveTelegraph]:
-        """턴 시작 시 텔레그래프 카운트다운. 발동 직전(0턴)인 것들 반환."""
         ready = []
         for tg in self.telegraphs:
             tg.turns_remaining -= 1
@@ -170,7 +190,6 @@ class Boss:
         return ready
 
     def finalize_telegraphs(self):
-        """impact 처리 완료된 텔레그래프 제거 (지속형은 유지)"""
         keep = []
         for tg in self.telegraphs:
             if tg.impacted and tg.post_impact_turns <= 0:
@@ -182,30 +201,33 @@ class Boss:
                 keep.append(tg)
         self.telegraphs = keep
 
-    # ─────────────────── 이동 ───────────────────
+    # ─────────────────── 이동 (유클리드) ───────────────────
 
-    def move_toward_top_aggro(self, occupied: Set[Pos]):
+    def move_toward(self, tx: float, ty: float,
+                    occupied_positions: List[Tuple[float, float, float]]):
+        """occupied_positions: [(x, y, radius), ...] 다른 유닛들.
+        보스는 원형 충돌 체크로 겹치지 않게 이동."""
         if self.invuln_turns > 0 or self.grog_turns > 0:
             return
-        top = self.top_aggro_uid()
-        if top is None:
+        if self.stagger_active:
+            return  # 스태거 wind_up 중 보스 정지 (파티 집결·딜 타임 확보)
+        dx = tx - self.x; dy = ty - self.y
+        dist = math.hypot(dx, dy)
+        if dist < 1e-4:
             return
-        target = occupied.get(top) if isinstance(occupied, dict) else None
-        # occupied가 dict가 아니라 set으로 온 경우 상위에서 직접 target 전달 필요
-        # 여기서는 단순 제자리 유지로 폴백
-
-    def move_toward(self, tx: int, ty: int, blocked: Set[Pos]):
-        if self.invuln_turns > 0 or self.grog_turns > 0:
-            return
-        dx = (1 if tx > self.x else (-1 if tx < self.x else 0))
-        dy = (1 if ty > self.y else (-1 if ty < self.y else 0))
-        # x축 우선
-        nx, ny = self.x + dx, self.y
-        if (nx, ny) not in blocked and 0 <= nx < self.config.map_width:
-            self.x = nx; return
-        nx, ny = self.x, self.y + dy
-        if (nx, ny) not in blocked and 0 <= ny < self.config.map_height:
-            self.y = ny
+        step = min(self.config.boss_move_speed, dist)
+        nx = self.x + dx / dist * step
+        ny = self.y + dy / dist * step
+        # 맵 경계 클램프
+        nx = max(self.config.boss_radius, min(self.config.map_width - self.config.boss_radius, nx))
+        ny = max(self.config.boss_radius, min(self.config.map_height - self.config.boss_radius, ny))
+        # 충돌 체크 (간단: 겹치면 이동 거리 축소해서 다시 시도)
+        blocked = False
+        for ox, oy, orad in occupied_positions:
+            if math.hypot(nx - ox, ny - oy) < self.config.boss_radius + orad - 0.05:
+                blocked = True; break
+        if not blocked:
+            self.x, self.y = nx, ny
 
     # ─────────────────── 피격 ───────────────────
 

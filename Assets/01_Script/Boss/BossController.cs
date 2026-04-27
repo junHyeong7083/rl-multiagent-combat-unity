@@ -12,8 +12,9 @@ namespace BossRaid
         [HideInInspector] public BossGameViewer viewer;
 
         [Header("Visual")]
-        public float moveLerpSpeed = 6f;
-        public float rotateLerpSpeed = 8f;
+        [Tooltip("한 턴(격자 1칸)을 몇 초에 이동할지 (Python TURN_INTERVAL과 맞추기)")]
+        public float turnDuration = 0.3f;
+        public float rotateLerpSpeed = 10f;
         public Animator animator;
         public Renderer[] bodyRenderers;
         public Color phase1Color = Color.white;
@@ -38,7 +39,9 @@ namespace BossRaid
         [Tooltip("Target까지 이 거리 이상이면 이동 중으로 판정")]
         public float movingThreshold = 0.05f;
 
+        private Vector3 _prevPos;
         private Vector3 _targetPos;
+        private float _interpStart = -1f;
         private Quaternion _targetRot = Quaternion.identity;
         private BossData _latestData;
         private bool _hasData;
@@ -49,12 +52,23 @@ namespace BossRaid
         public void ApplySnapshot(BossData b)
         {
             _latestData = b;
-            _hasData = true;
 
-            // 2x2 중심 = (x+0.5, y+0.5)
-            var world = viewer.GridToWorld(b.x, b.y)
-                        + new Vector3(0.5f * viewer.cellSize, 0f, 0.5f * viewer.cellSize);
+            // 유클리드 float 좌표를 월드로 직접 변환 (보스 중심이 곧 (x, y))
+            var world = viewer.ContinuousToWorld(b.x, b.y);
+
+            // 신규 타겟: 현재 위치에서부터 턴 시간 동안 등속 보간
+            if (!_hasData)
+            {
+                transform.position = world;
+                _prevPos = world;
+            }
+            else
+            {
+                _prevPos = transform.position;
+            }
             _targetPos = world;
+            _interpStart = Time.time;
+            _hasData = true;
 
             ApplyPhaseColor(b.phase);
 
@@ -117,19 +131,43 @@ namespace BossRaid
         private void Update()
         {
             if (!_hasData) return;
-            var diff = _targetPos - transform.position;
-            float dist = diff.magnitude;
 
-            transform.position = Vector3.Lerp(transform.position, _targetPos, Time.deltaTime * moveLerpSpeed);
-            if (diff.sqrMagnitude > 0.0001f)
+            // 등속 보간 with smoothstep easing
+            float elapsed = Time.time - _interpStart;
+            float t = Mathf.Clamp01(elapsed / Mathf.Max(0.01f, turnDuration));
+            // Smoothstep: 시작·끝만 살짝 부드럽게 (중간은 거의 등속)
+            float te = t * t * (3f - 2f * t);
+            Vector3 newPos = Vector3.LerpUnclamped(_prevPos, _targetPos, te);
+
+            var moveDir = newPos - transform.position;
+            transform.position = newPos;
+
+            // 이동 중이면 이동 방향, 정지(또는 거의 정지)면 가장 가까운 유닛을 바라봄
+            Vector3 faceTarget;
+            bool haveFace = false;
+            if (moveDir.sqrMagnitude > 0.0004f)
             {
-                _targetRot = Quaternion.LookRotation(new Vector3(diff.x, 0, diff.z).normalized, Vector3.up);
+                faceTarget = transform.position + moveDir.normalized;
+                haveFace = true;
+            }
+            else if (viewer != null && viewer.TryGetNearestUnitPosition(transform.position, out var nearest))
+            {
+                faceTarget = nearest;
+                haveFace = true;
+            }
+            else faceTarget = transform.position + transform.forward;
+
+            if (haveFace)
+            {
+                var flat = new Vector3(faceTarget.x - transform.position.x, 0, faceTarget.z - transform.position.z);
+                if (flat.sqrMagnitude > 0.0001f)
+                    _targetRot = Quaternion.LookRotation(flat.normalized, Vector3.up);
             }
             transform.rotation = Quaternion.Slerp(transform.rotation, _targetRot, Time.deltaTime * rotateLerpSpeed);
 
             if (animator != null)
             {
-                bool moving = dist > movingThreshold && (_latestData == null || _latestData.grog <= 0);
+                bool moving = t < 0.95f && (_latestData == null || _latestData.grog <= 0);
                 animator.SetBool(paramIsMoving, moving);
             }
         }

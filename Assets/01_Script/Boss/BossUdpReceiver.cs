@@ -83,14 +83,11 @@ namespace BossRaid
         }
 
         /// <summary>
-        /// JsonUtility의 한계(2차원 배열 미지원) 우회:
-        /// Python에서 "danger_tiles": [[x,y], ...]로 보내므로 문자열 치환 후 수동 파싱.
+        /// Python BossRaidEnv.get_snapshot() JSON을 BossSnapshot으로 파싱.
+        /// 텔레그래프 shapes 배열 등을 위해 MiniJSON 스타일 수동 파서(BossJsonParser) 사용.
         /// </summary>
         private BossSnapshot ParseSnapshot(string json)
         {
-            // JsonUtility로는 int[][]를 못 읽으므로, 최상위 객체만 먼저 읽고 danger_tiles는 보완 파싱.
-            // 우회: "danger_tiles":[[1,2],[3,4]] → 임시 문자열로 치환 → 나중에 수동 복원.
-            // 간단화를 위해 MiniJSON 스타일 수동 파서 사용.
             try
             {
                 return BossJsonParser.Parse(json);

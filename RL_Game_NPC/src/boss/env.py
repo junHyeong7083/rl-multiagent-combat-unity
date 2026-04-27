@@ -1,12 +1,14 @@
-"""BossRaidEnv — 1보스 4파티 레이드 환경
+"""BossRaidEnv — 유클리드 연속 공간 1보스 4파티 레이드 환경
 
-- 동시 행동 처리 (원 논문 방식 계승)
-- 보스 FSM 1체 + 파티 유닛 4명
-- 플레이어(딜러) 1명은 외부에서 action 주입받음
+- 위치: float (0.0 ~ map_width/height)
+- 이동: 4방향, 한 턴당 move_speed 만큼 (유닛 반경 기반 충돌)
+- 패턴: 기하 도형 (Circle/Line/Fan/Cross) — contains(pos) 판정
+- 관찰: 상대 위치 벡터 + 8방향 위험 센서
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
+import math
 import numpy as np
 import random
 
@@ -15,37 +17,35 @@ from .config import (
     ROLE_STATS_BOSS,
 )
 from .boss import Boss
-from .patterns import ActiveTelegraph, Pos
+from .patterns import ActiveTelegraph, Pos, sample_danger_sensor
 from .rewards import RewardComputer
 
 
-# ─────────────────── 파티 유닛 ───────────────────
+# ─────────────────── 파티 유닛 (유클리드) ───────────────────
 
 @dataclass
 class PartyUnit:
     uid: int
     role: PartyRole
-    x: int
-    y: int
+    x: float
+    y: float
     hp: int
     mp: int
     max_hp: int
     max_mp: int
     attack: int
     defense: int
-    attack_range: int
+    attack_range: float
+    move_speed: float
+    radius: float
     alive: bool = True
-    # 쿨타임 (스킬·도발·힐·버프 등)
     cooldowns: Dict[int, int] = field(default_factory=dict)
-    # 버프 (남은 턴)
     buff_atk: int = 0
     buff_shield: int = 0
     buff_guard: int = 0
-    # 디버프
-    marked_turns: int = 0     # MARK 대상
+    marked_turns: int = 0
     chained_with: Optional[int] = None
     chain_turns: int = 0
-    # 통계
     total_damage_dealt: int = 0
     total_damage_taken: int = 0
     total_heal_done: int = 0
@@ -54,9 +54,9 @@ class PartyUnit:
 # ─────────────────── 환경 ───────────────────
 
 class BossRaidEnv:
-    """보스 레이드 환경.
+    """보스 레이드 환경 (유클리드).
 
-    agent_ids: "p0", "p1", "p2", "p3" (파티 슬롯 순서 = DEALER, TANK, HEALER, SUPPORT)
+    agent_ids: "p0" ~ "p3" (DEALER, TANK, HEALER, SUPPORT)
     """
 
     def __init__(self, config: Optional[BossConfig] = None, seed: Optional[int] = None):
@@ -70,9 +70,14 @@ class BossRaidEnv:
         self.done = False
         self.wipe = False
         self.victory = False
+        self.combat_started = False  # user_test_mode: 플레이어가 보스 인식 범위 진입 전엔 False
 
         self.reward_computer = RewardComputer(self.config)
         self.step_events: Dict[int, List[dict]] = {}
+
+        # 속도 계산용 이전 위치
+        self._prev_unit_positions: Dict[int, Tuple[float, float]] = {}
+        self._prev_boss_pos: Tuple[float, float] = (0.0, 0.0)
 
         self.reset()
 
@@ -101,27 +106,62 @@ class BossRaidEnv:
         self.done = False
         self.wipe = False
         self.victory = False
+        self.combat_started = False
         self.step_events.clear()
+        self._seal_hold_count = 0
 
-        # 파티 유닛 배치 — 보스 반대편 사분면에 모여 시작
         self.units.clear()
-        w, h = self.config.map_width, self.config.map_height
-        start_positions = [(3, 3), (3, 4), (4, 3), (4, 4)]
+
+        # ── 보스 위치 ──
+        if self.config.user_test_mode:
+            # 실전 시연: 보스 고정 spawn (우상단 등 정해진 위치)
+            boss_x = self.config.boss_spawn_x
+            boss_y = self.config.boss_spawn_y
+            # 파티는 맵 반대편 (좌하단) 에서 시작 → 플레이어가 보스 쪽으로 이동해야 함
+            margin = 3.0
+            center_x = max(margin, min(self.config.map_width - margin, self.config.map_width - boss_x))
+            center_y = max(margin, min(self.config.map_height - margin, self.config.map_height - boss_y))
+        else:
+            # 학습용 랜덤 배치
+            margin = 3.0
+            boss_x = self.rng.uniform(margin, self.config.map_width - margin)
+            boss_y = self.rng.uniform(margin, self.config.map_height - margin)
+            party_angle = self.rng.uniform(0, 2 * math.pi)
+            party_dist = self.rng.uniform(5.0, 8.0)
+            center_x = boss_x + math.cos(party_angle) * party_dist
+            center_y = boss_y + math.sin(party_angle) * party_dist
+            center_x = max(margin, min(self.config.map_width - margin, center_x))
+            center_y = max(margin, min(self.config.map_height - margin, center_y))
+
+        # 4명을 중심 주변 ±1.0 범위에 흩뿌림
         for i, role in enumerate(self.config.party_roles):
             stats = ROLE_STATS_BOSS[role]
-            sx, sy = start_positions[i]
+            sx = center_x + self.rng.uniform(-1.0, 1.0)
+            sy = center_y + self.rng.uniform(-1.0, 1.0)
+            sx = max(stats.radius, min(self.config.map_width - stats.radius, sx))
+            sy = max(stats.radius, min(self.config.map_height - stats.radius, sy))
             u = PartyUnit(
                 uid=i, role=role, x=sx, y=sy,
                 hp=stats.hp, mp=stats.mp,
                 max_hp=stats.hp, max_mp=stats.mp,
                 attack=stats.attack, defense=stats.defense,
                 attack_range=stats.attack_range,
+                move_speed=stats.move_speed,
+                radius=stats.radius,
             )
             self.units[i] = u
 
-        # 보스 초기화 (맵 중앙)
         self.boss = Boss(config=self.config, rng=self.rng)
+        self.boss.x = boss_x
+        self.boss.y = boss_y
         self.boss.hp = self.config.boss_max_hp
+
+        # 초기 어그로 약간 랜덤화 (탱커 고정 학습 방지)
+        for u in self.units.values():
+            self.boss.aggro[u.uid] = self.rng.uniform(0, 5)
+
+        self._prev_boss_pos = (self.boss.x, self.boss.y)
+        self._prev_unit_positions = {u.uid: (u.x, u.y) for u in self.units.values()}
 
         return self._get_all_observations()
 
@@ -133,42 +173,80 @@ class BossRaidEnv:
         Dict[str, bool],
         Dict[str, dict],
     ]:
-        """actions: {"p0": action_id, ...}"""
+        self._prev_boss_pos = (self.boss.x, self.boss.y)
+        self._prev_unit_positions = {u.uid: (u.x, u.y) for u in self.units.values()}
+
         self.step_events = {uid: [] for uid in self.units}
         self.current_step += 1
 
-        # 1. 보스: 페이즈 전이 체크
+        # ── 0. 실전 모드: 전투 시작 게이트 ──
+        if self.config.user_test_mode and not self.combat_started:
+            player = self.units[self.config.player_slot]
+            d = math.hypot(player.x - self.boss.x, player.y - self.boss.y)
+            if d <= self.config.boss_detection_range:
+                self.combat_started = True
+            else:
+                # 전투 미시작: 파티 이동만 처리, 보스 정지·패턴 비활성
+                self._resolve_party_actions(actions)
+                # 버프 디버프 틱은 진행 (쿨다운만)
+                for u in self.units.values():
+                    for k in list(u.cooldowns.keys()):
+                        u.cooldowns[k] = max(0, u.cooldowns[k] - 1)
+                obs = self._get_all_observations()
+                rewards = {aid: 0.0 for aid in self.agent_ids()}
+                dones = {aid: False for aid in self.agent_ids()}
+                infos = self._build_infos()
+                return obs, rewards, dones, infos
+
+        # 1. 페이즈 전이 → Seal Break 자동 발동
         phase_changed = self.boss.check_phase_transition()
         if phase_changed:
             for uid in self.units:
                 self.step_events[uid].append({"type": "phase_clear"})
+            # 봉인 해제 패턴 강제 발동
+            self.boss.start_pattern(
+                PatternID.SEAL_BREAK,
+                self.party_positions(),
+                self.party_roles(),
+                extra_override={"dealer_uid": self.config.player_slot},
+            )
 
-        # 2. 보스: 텔레그래프 카운트다운
+        # 2. 텔레그래프 카운트다운
         ready_telegraphs = self.boss.tick_telegraphs()
 
-        # 3. 파티 행동 처리 (동시 처리)
+        # 3. 파티 행동 (동시 처리)
         self._resolve_party_actions(actions)
 
-        # 4. 보스 텔레그래프 impact 적용
+        # 4. 텔레그래프 impact
         for tg in ready_telegraphs:
             self._apply_telegraph_impact(tg)
             tg.impacted = True
 
-        # 5. 보스 기본 공격 (쿨 없음, 매 턴 가능, 단 텔레그래프 없거나 그로기 아닐 때)
-        if self.boss.invuln_turns <= 0 and self.boss.grog_turns <= 0:
-            # 신규 패턴 시전
-            if len(self.boss.telegraphs) < self.config.max_active_telegraphs:
-                pid = self.boss.select_pattern()
-                if pid is not None:
-                    self.boss.start_pattern(pid, self.party_positions(), self.party_roles())
+        # 5. Seal Break 활성 중이면 보스 정지 (이동/패턴 없음)
+        seal_active = any(tg.pattern_id == PatternID.SEAL_BREAK for tg in self.boss.telegraphs)
 
-        # 6. 지속형 디버프 (연결) 처리
+        if not seal_active and not self.boss.stagger_active:
+            # 신규 패턴 시전 (스태거 wind_up 중엔 다른 패턴 차단 — 파티 집결 보장)
+            if self.boss.invuln_turns <= 0 and self.boss.grog_turns <= 0:
+                if len(self.boss.telegraphs) < self.config.max_active_telegraphs:
+                    pid = self.boss.select_pattern()
+                    if pid is not None:
+                        self.boss.start_pattern(pid, self.party_positions(), self.party_roles())
+
+        # 5b. Seal Break 매 턴 유지 체크
+        self._tick_seal_break()
+
+        # 6. 체인 지속 효과
         self._tick_chains()
 
-        # 7. 보스 이동 — 어그로 1위 방향
-        top_uid = self.boss.top_aggro_uid()
-        if top_uid is not None and top_uid in self.units and self.units[top_uid].alive:
-            self._move_boss_toward(self.units[top_uid].x, self.units[top_uid].y)
+        # 7. 보스 이동 — Seal 중이면 정지
+        if not seal_active:
+            top_uid = self.boss.top_aggro_uid()
+            if top_uid is not None and top_uid in self.units and self.units[top_uid].alive:
+                t = self.units[top_uid]
+                others = [(u.x, u.y, u.radius) for u in self.units.values()
+                          if u.alive and u.uid != top_uid]
+                self.boss.move_toward(t.x, t.y, others)
 
         # 8. 텔레그래프 정리
         self.boss.finalize_telegraphs()
@@ -189,40 +267,50 @@ class BossRaidEnv:
         player_uid = self.config.player_slot
         self.victory = self.boss.hp <= 0
         self.wipe = all((not u.alive) for u in self.units.values())
-        player_dead = not self.units[player_uid].alive
-        self.done = (
-            self.victory or self.wipe or player_dead or
-            self.current_step >= self.config.max_steps
-        )
+        # NOTE: 학습 중 딜러(플레이어) 사망해도 에피소드 계속 (NPC 학습 기회 보장)
+        #       실전(boss_streamer)에서는 wipe에 딜러 포함되므로 문제 없음
+        if self.config.user_test_mode:
+            # 실전 모드: 보스 처치 또는 전멸까지 계속 (max_steps 무시)
+            self.done = self.victory or self.wipe
+        else:
+            self.done = (
+                self.victory or self.wipe or
+                self.current_step >= self.config.max_steps
+            )
 
-        # 12. 관찰, 보상, done, info 반환
         obs = self._get_all_observations()
         rewards = self.reward_computer.compute(self)
         dones = {aid: self.done for aid in self.agent_ids()}
         infos = self._build_infos()
         return obs, rewards, dones, infos
 
-    # ────────────── 파티 행동 처리 ──────────────
+    # ────────────── 파티 행동 ──────────────
 
     def _resolve_party_actions(self, actions: Dict[str, int]):
-        # 이동 먼저 (동시 이동 - 충돌 처리)
-        move_targets: Dict[int, Pos] = {}
+        # 이동 의도 수집
+        move_intents: Dict[int, Tuple[float, float]] = {}
         for aid, action in actions.items():
             uid = self.uid_of(aid)
             u = self.units[uid]
             if not u.alive: continue
-            move_targets[uid] = self._compute_move(u, action)
+            move_intents[uid] = self._compute_move_delta(u, action)
 
-        # 충돌 처리: 같은 타일로 2명이 가면 먼저 선언한 쪽만 허용 (uid 낮은 순)
-        occupied: Set[Pos] = set()
-        boss_tiles = self._boss_tiles()
-        occupied |= boss_tiles
-        for uid in sorted(move_targets.keys()):
-            tgt = move_targets[uid]
-            if tgt in occupied:
-                continue
-            self.units[uid].x, self.units[uid].y = tgt
-            occupied.add(tgt)
+        # 동시 이동 (간단 충돌: uid 낮은 순으로 자리 잡음)
+        for uid in sorted(move_intents.keys()):
+            dx, dy = move_intents[uid]
+            if dx == 0 and dy == 0: continue
+            u = self.units[uid]
+            new_x = u.x + dx; new_y = u.y + dy
+            # 맵 경계
+            new_x = max(u.radius, min(self.config.map_width - u.radius, new_x))
+            new_y = max(u.radius, min(self.config.map_height - u.radius, new_y))
+            # 다른 유닛/보스 충돌 체크
+            blocked = False
+            for ox, oy, orad in self._occupied_circles(exclude_uid=uid):
+                if math.hypot(new_x - ox, new_y - oy) < u.radius + orad - 0.05:
+                    blocked = True; break
+            if not blocked:
+                u.x, u.y = new_x, new_y
 
         # 비이동 액션
         for aid, action in actions.items():
@@ -231,23 +319,36 @@ class BossRaidEnv:
             if not u.alive: continue
             self._execute_non_move(u, action)
 
-    def _compute_move(self, u: PartyUnit, action: int) -> Pos:
-        x, y = u.x, u.y
-        if action == BossActionID.MOVE_UP:    y = max(0, y - 1)
-        elif action == BossActionID.MOVE_DOWN: y = min(self.config.map_height - 1, y + 1)
-        elif action == BossActionID.MOVE_LEFT: x = max(0, x - 1)
-        elif action == BossActionID.MOVE_RIGHT: x = min(self.config.map_width - 1, x + 1)
-        return (x, y)
+    def _compute_move_delta(self, u: PartyUnit, action: int) -> Tuple[float, float]:
+        s = u.move_speed
+        d = s * 0.7071  # 대각 이동: 같은 거리 유지 (s / sqrt(2))
+        if action == BossActionID.MOVE_UP:         return (0.0, -s)
+        if action == BossActionID.MOVE_DOWN:       return (0.0, s)
+        if action == BossActionID.MOVE_LEFT:       return (-s, 0.0)
+        if action == BossActionID.MOVE_RIGHT:      return (s, 0.0)
+        if action == BossActionID.MOVE_UP_LEFT:    return (-d, -d)
+        if action == BossActionID.MOVE_UP_RIGHT:   return (d, -d)
+        if action == BossActionID.MOVE_DOWN_LEFT:  return (-d, d)
+        if action == BossActionID.MOVE_DOWN_RIGHT: return (d, d)
+        return (0.0, 0.0)
+
+    def _occupied_circles(self, exclude_uid: Optional[int] = None):
+        """현재 맵의 점유 원형 리스트 반환: (x, y, radius).
+
+        MMORPG 관례: 파티원끼리는 겹쳐도 됨 (stagger 집결 등 필요). 보스만 몸통 차단.
+        """
+        return [(self.boss.x, self.boss.y, self.config.boss_radius)]
 
     def _execute_non_move(self, u: PartyUnit, action: int):
         a = BossActionID(action)
-        if a in (BossActionID.STAY, BossActionID.MOVE_UP, BossActionID.MOVE_DOWN,
-                 BossActionID.MOVE_LEFT, BossActionID.MOVE_RIGHT):
+        if a in (BossActionID.STAY,
+                 BossActionID.MOVE_UP, BossActionID.MOVE_DOWN,
+                 BossActionID.MOVE_LEFT, BossActionID.MOVE_RIGHT,
+                 BossActionID.MOVE_UP_LEFT, BossActionID.MOVE_UP_RIGHT,
+                 BossActionID.MOVE_DOWN_LEFT, BossActionID.MOVE_DOWN_RIGHT):
             return
 
         role = u.role
-
-        # 역할 제한
         role_allowed = {
             BossActionID.ATTACK_BASIC: True,
             BossActionID.ATTACK_SKILL: True,
@@ -262,7 +363,6 @@ class BossRaidEnv:
             self.step_events[u.uid].append({"type": "invalid_action"})
             return
 
-        # 쿨타임 체크
         if u.cooldowns.get(int(a), 0) > 0:
             self.step_events[u.uid].append({"type": "invalid_action"})
             return
@@ -275,9 +375,12 @@ class BossRaidEnv:
         elif a == BossActionID.TAUNT:
             u.cooldowns[int(a)] = self.config.skill_cooldown
             self.boss.add_aggro(u.uid, self.config.aggro_taunt_bonus)
-            # 스태거 기여
             if self.boss.stagger_active:
                 self.boss.stagger_gauge -= self.config.stagger_contrib_taunt
+                self.step_events[u.uid].append({
+                    "type": "stagger_contribute",
+                    "amount": self.config.stagger_contrib_taunt,
+                })
             self.step_events[u.uid].append({"type": "taunt"})
         elif a == BossActionID.GUARD:
             u.cooldowns[int(a)] = self.config.skill_cooldown
@@ -295,58 +398,60 @@ class BossRaidEnv:
             u.cooldowns[int(a)] = self.config.skill_cooldown
             self._do_buff(u, kind="shield")
 
-    # ────────────── 액션 효과 ──────────────
+    # ────────────── 액션 효과 (유클리드 거리) ──────────────
 
     def _do_attack(self, u: PartyUnit, skill: bool):
-        # 보스 사거리 체크 (보스 2x2 영역까지의 최소 체비셰프 거리)
+        # Seal Break 중 보스 데미지 50% 감소 (완전 무적이면 학습 불가)
+        seal_active = any(tg.pattern_id == PatternID.SEAL_BREAK for tg in self.boss.telegraphs)
+
         dist = self._boss_dist(u.x, u.y)
         if dist > u.attack_range:
             self.step_events[u.uid].append({"type": "invalid_action"})
             return
         dmg = u.attack * (2 if skill else 1)
+        if seal_active:
+            dmg = dmg // 2                               # Seal 중 딜 50% 감소
         if u.buff_atk > 0:
             dmg = int(dmg * 1.3)
         actual = self.boss.take_damage(dmg, u.uid)
         u.total_damage_dealt += actual
         self.step_events[u.uid].append({"type": "damage", "amount": actual, "skill": skill})
-        # 스태거 기여
         if self.boss.stagger_active:
             contrib = (self.config.stagger_contrib_skill if skill else self.config.stagger_contrib_basic)
             self.boss.stagger_gauge -= contrib
-        # 어그로 1위 소비 (기본공격은 어그로를 "소비")
+            self.step_events[u.uid].append({
+                "type": "stagger_contribute", "amount": contrib,
+            })
         if not skill:
-            self.boss.aggro[u.uid] = max(0, self.boss.aggro.get(u.uid, 0) - self.config.aggro_basic_target_cost * 0.1)
+            self.boss.aggro[u.uid] = max(0, self.boss.aggro.get(u.uid, 0)
+                                           - self.config.aggro_basic_target_cost * 0.1)
 
     def _do_heal(self, u: PartyUnit):
-        # 가장 HP 비율 낮은 아군에게 힐 (사거리 내)
         candidates = [
             x for x in self.units.values()
-            if x.alive and abs(x.x - u.x) + abs(x.y - u.y) <= u.attack_range
+            if x.alive and math.hypot(x.x - u.x, x.y - u.y) <= u.attack_range
         ]
         if not candidates: return
         target = min(candidates, key=lambda x: x.hp / max(1, x.max_hp))
-        heal = 40
+        heal = 80                                 # 60 → 80 (plateau 탈출용 생존력 ↑↑)
         amount = min(target.max_hp - target.hp, heal)
         target.hp += amount
         u.total_heal_done += amount
         self.step_events[u.uid].append({"type": "heal", "target": target.uid, "amount": amount})
 
     def _do_cleanse(self, u: PartyUnit):
-        # 사거리 내 marked_turns / chain_turns 해제
         for x in self.units.values():
             if not x.alive: continue
-            if abs(x.x - u.x) + abs(x.y - u.y) > u.attack_range + 1: continue
+            if math.hypot(x.x - u.x, x.y - u.y) > u.attack_range + 0.5: continue
             if x.marked_turns > 0:
                 x.marked_turns = 0
                 self.step_events[u.uid].append({"type": "cleanse", "target": x.uid})
-            # 체인 해제는 아님 — 체인은 유지 조건만 있음
 
     def _do_buff(self, u: PartyUnit, kind: str):
-        # 가장 가까운 아군 (자신 제외)에게 버프
         candidates = [x for x in self.units.values() if x.alive and x.uid != u.uid]
         if not candidates: return
-        target = min(candidates, key=lambda x: abs(x.x - u.x) + abs(x.y - u.y))
-        if abs(target.x - u.x) + abs(target.y - u.y) > u.attack_range + 1: return
+        target = min(candidates, key=lambda x: math.hypot(x.x - u.x, x.y - u.y))
+        if math.hypot(target.x - u.x, target.y - u.y) > u.attack_range + 0.5: return
         if kind == "atk":
             target.buff_atk = 3
         else:
@@ -355,37 +460,17 @@ class BossRaidEnv:
 
     # ────────────── 보스 관련 ──────────────
 
-    def _boss_tiles(self) -> Set[Pos]:
-        s = set()
-        for dx in range(self.config.boss_size):
-            for dy in range(self.config.boss_size):
-                s.add((self.boss.x + dx, self.boss.y + dy))
-        return s
+    def _boss_dist(self, x: float, y: float) -> float:
+        """유닛 위치에서 보스 원형 표면까지의 유클리드 거리 (음수면 안에 있음)."""
+        center_dist = math.hypot(x - self.boss.x, y - self.boss.y)
+        return max(0.0, center_dist - self.config.boss_radius)
 
-    def _boss_dist(self, x: int, y: int) -> int:
-        """보스 2x2 영역과의 체비셰프 거리"""
-        bx1, bx2 = self.boss.x, self.boss.x + self.config.boss_size - 1
-        by1, by2 = self.boss.y, self.boss.y + self.config.boss_size - 1
-        if bx1 <= x <= bx2 and by1 <= y <= by2:
-            return 0
-        dx = 0 if bx1 <= x <= bx2 else min(abs(x - bx1), abs(x - bx2))
-        dy = 0 if by1 <= y <= by2 else min(abs(y - by1), abs(y - by2))
-        return max(dx, dy)
-
-    def _move_boss_toward(self, tx: int, ty: int):
-        if self.boss.invuln_turns > 0 or self.boss.grog_turns > 0:
-            return
-        # 1칸 이동, 유닛/벽과 겹치지 않게
-        unit_tiles = {(u.x, u.y) for u in self.units.values() if u.alive}
-        dx = 1 if tx > self.boss.x else (-1 if tx < self.boss.x else 0)
-        dy = 1 if ty > self.boss.y else (-1 if ty < self.boss.y else 0)
-        for nx, ny in [(self.boss.x + dx, self.boss.y), (self.boss.x, self.boss.y + dy)]:
-            # 2x2 공간 확보 가능한지
-            candidate = {(nx + ddx, ny + ddy) for ddx in range(self.config.boss_size) for ddy in range(self.config.boss_size)}
-            in_bounds = all(0 <= p[0] < self.config.map_width and 0 <= p[1] < self.config.map_height for p in candidate)
-            if in_bounds and not (candidate & unit_tiles):
-                self.boss.x, self.boss.y = nx, ny
-                return
+    def _quadrant(self, x: float, y: float) -> int:
+        cx, cy = self.config.map_width / 2.0, self.config.map_height / 2.0
+        q = 0
+        if x >= cx: q |= 1
+        if y >= cy: q |= 2
+        return q
 
     # ────────────── 텔레그래프 Impact ──────────────
 
@@ -394,26 +479,24 @@ class BossRaidEnv:
         dmg = tg.extra.get("damage", 0)
 
         if pid == PatternID.MARK:
-            # 표식 대상이 파티에서 멀리 떨어졌는지 체크
             if not tg.target_unit_ids: return
             mark_uid = tg.target_unit_ids[0]
             if mark_uid not in self.units or not self.units[mark_uid].alive: return
             mu = self.units[mark_uid]
             mu.marked_turns = 0
-            # 파티 다른 유닛들과의 최소 거리
+            # 파훼 성공 조건: 다른 유닛 모두가 escape_distance 이상 떨어짐
             others = [u for u in self.units.values() if u.uid != mark_uid and u.alive]
             if not others: return
-            min_dist = min(max(abs(u.x - mu.x), abs(u.y - mu.y)) for u in others)
-            if min_dist >= 5:
-                # 파훼 성공: 보스 1턴 경직
+            min_dist = min(math.hypot(u.x - mu.x, u.y - mu.y) for u in others)
+            if min_dist >= self.config.pat_mark_escape_distance:
                 self.boss.grog_turns = max(self.boss.grog_turns, 1)
                 for u in self.units.values():
                     self.step_events[u.uid].append({"type": "mechanic_success", "pattern": int(pid)})
             else:
-                # 실패: 5x5 폭발
+                # 표식 위치 기준 원형 폭발
                 for u in self.units.values():
                     if not u.alive: continue
-                    if max(abs(u.x - mu.x), abs(u.y - mu.y)) <= 2:
+                    if math.hypot(u.x - mu.x, u.y - mu.y) <= self.config.pat_mark_blast_radius:
                         self._deal_damage_to_unit(u, dmg)
                 for u in self.units.values():
                     self.step_events[u.uid].append({"type": "mechanic_fail", "pattern": int(pid)})
@@ -431,16 +514,7 @@ class BossRaidEnv:
             self.boss.stagger_active = False
             self.boss.stagger_gauge = 0
 
-        elif pid == PatternID.CROSS_INFERNO:
-            safe_quads = tg.target_unit_ids  # 2개 사분면
-            for u in self.units.values():
-                if not u.alive: continue
-                q = self._quadrant(u.x, u.y)
-                if q not in safe_quads:
-                    self._deal_damage_to_unit(u, dmg)
-
         elif pid == PatternID.CURSED_CHAIN:
-            # 시작 시점: 두 유닛에 체인 부여, 6턴 지속
             if len(tg.target_unit_ids) >= 2:
                 a_uid, b_uid = tg.target_unit_ids[:2]
                 if a_uid in self.units and b_uid in self.units:
@@ -450,11 +524,16 @@ class BossRaidEnv:
                     self.units[b_uid].chain_turns = 6
                     self.boss.active_chain = {"pair": (a_uid, b_uid), "turns": 6}
 
+        elif pid == PatternID.SEAL_BREAK:
+            # Seal Break는 _tick_seal_break()에서 매 턴 처리.
+            # wind_up 만료 시 여기 도달하면 이미 처리됐거나 타임아웃.
+            pass
+
         else:
-            # 일반 장판형 패턴
+            # 일반 기하 패턴 — tg.contains() 사용
             for u in self.units.values():
                 if not u.alive: continue
-                if (u.x, u.y) in tg.danger_tiles:
+                if tg.contains((u.x, u.y)):
                     self._deal_damage_to_unit(u, dmg)
 
     def _deal_damage_to_unit(self, u: PartyUnit, amount: int):
@@ -470,132 +549,396 @@ class BossRaidEnv:
         else:
             self.step_events[u.uid].append({"type": "damage_taken", "amount": actual})
 
-    def _quadrant(self, x: int, y: int) -> int:
-        cx, cy = self.config.map_width // 2, self.config.map_height // 2
-        if x < cx and y < cy: return 0
-        if x >= cx and y < cy: return 1
-        if x < cx and y >= cy: return 2
-        return 3
+    # ────────────── Seal Break 매 턴 체크 ──────────────
+
+    _seal_hold_count: int = 0   # 연속 유지 턴 수
+
+    def _tick_seal_break(self):
+        """Seal Break: 매 턴 3장판 점유 상태 체크.
+        - 도착 단계: 아직 3개 안 채움 → 카운트 안 함
+        - 유지 단계: 3개 모두 채워진 순간부터 hold 카운트
+        - hold 중 누가 나가면 → 즉시 전멸
+        - hold 완료 → 성공
+        """
+        from itertools import permutations
+        for tg in self.boss.telegraphs:
+            if tg.pattern_id != PatternID.SEAL_BREAK:
+                continue
+
+            # ── 동적 재배정: 딜러가 향한 spot 을 dealer_spot 으로, NPC 는 나머지 ──
+            dealer = self.units[self.config.player_slot]
+            dealer_spot_idx = min(range(len(tg.shapes)),
+                                  key=lambda i: math.hypot(
+                                      dealer.x - tg.shapes[i].params["cx"],
+                                      dealer.y - tg.shapes[i].params["cy"]
+                                  ))
+            if tg.target_unit_ids:
+                tg.target_unit_ids[0] = dealer_spot_idx
+            available = [i for i in range(len(tg.shapes)) if i != dealer_spot_idx]
+            npc_uids = sorted(uid for uid in self.units
+                              if uid != self.config.player_slot
+                              and self.units[uid].alive)
+            if npc_uids:
+                best_perm, best_total = None, 1e18
+                for perm in permutations(available, len(npc_uids)):
+                    total = sum(math.hypot(
+                        self.units[uid].x - tg.shapes[si].params["cx"],
+                        self.units[uid].y - tg.shapes[si].params["cy"]
+                    ) for uid, si in zip(npc_uids, perm))
+                    if total < best_total:
+                        best_total, best_perm = total, perm
+                if best_perm:
+                    tg.extra["npc_spots"] = dict(zip(npc_uids, best_perm))
+
+            npc_spots = []
+
+            for si, shape in enumerate(tg.shapes):
+                if si == dealer_spot_idx:
+                    continue
+                sx, sy = shape.params["cx"], shape.params["cy"]
+                occupied = False
+                for u in self.units.values():
+                    if u.uid == self.config.player_slot or not u.alive:
+                        continue
+                    if math.hypot(u.x - sx, u.y - sy) <= shape.params["r"]:
+                        occupied = True
+                        break
+                npc_spots.append(occupied)
+
+            all_occupied = all(npc_spots) and len(npc_spots) >= 3
+
+            if all_occupied:
+                self._seal_hold_count += 1
+
+                # 유지 중 보상 (매 턴)
+                for u in self.units.values():
+                    self.step_events[u.uid].append({
+                        "type": "seal_holding",
+                        "hold": self._seal_hold_count,
+                        "needed": self.config.pat_seal_hold_turns,
+                    })
+
+                # 유지 완료!
+                if self._seal_hold_count >= self.config.pat_seal_hold_turns:
+                    self.boss.grog_turns = max(self.boss.grog_turns, self.config.pat_seal_success_grog)
+                    for u in self.units.values():
+                        self.step_events[u.uid].append({"type": "seal_success"})
+                    # 텔레그래프 제거
+                    tg.impacted = True
+                    tg.post_impact_turns = 0
+                    self._seal_hold_count = 0
+                    return
+
+            elif self._seal_hold_count > 0:
+                # 유지 중 누가 나감 → 즉시 전멸!
+                for u in self.units.values():
+                    if u.alive:
+                        self._deal_damage_to_unit(u, self.config.pat_seal_fail_damage)
+                    self.step_events[u.uid].append({"type": "seal_fail", "reason": "broke_hold"})
+                tg.impacted = True
+                tg.post_impact_turns = 0
+                self._seal_hold_count = 0
+                return
+
+            # 도착 시간 초과 체크 (wind_up 끝났는데 아직 hold 시작 안 함)
+            arrive_deadline = tg.total_wind_up - self.config.pat_seal_hold_turns
+            turns_elapsed = tg.total_wind_up - tg.turns_remaining
+            if turns_elapsed >= arrive_deadline and self._seal_hold_count == 0 and not all_occupied:
+                # 도착 시간 지남 + 아직 3명 안 모임 → 실패
+                for u in self.units.values():
+                    if u.alive:
+                        self._deal_damage_to_unit(u, self.config.pat_seal_fail_damage)
+                    self.step_events[u.uid].append({"type": "seal_fail", "reason": "timeout"})
+                tg.impacted = True
+                tg.post_impact_turns = 0
+                self._seal_hold_count = 0
+                return
+
+            return  # Seal은 최대 1개
 
     def _tick_chains(self):
-        pair = None
         for u in self.units.values():
             if u.chain_turns > 0 and u.chained_with is not None:
                 partner = self.units.get(u.chained_with)
                 if partner and partner.alive:
-                    d = max(abs(u.x - partner.x), abs(u.y - partner.y))
-                    if d > 3:
-                        self._deal_damage_to_unit(u, 25)
+                    d = math.hypot(u.x - partner.x, u.y - partner.y)
+                    if d > self.config.pat_chain_max_distance:
+                        self._deal_damage_to_unit(u, self.config.chain_damage)
                 u.chain_turns -= 1
                 if u.chain_turns <= 0:
                     u.chained_with = None
 
-    # ────────────── 관찰 ──────────────
+    # ────────────── 관찰 (유클리드) ──────────────
 
     def _get_all_observations(self) -> Dict[str, np.ndarray]:
         return {aid: self._observe(self.uid_of(aid)) for aid in self.agent_ids()}
 
     def _observe(self, uid: int) -> np.ndarray:
-        """92차원 관찰 벡터 (boss_design.md 참조)"""
+        """B안 관측 벡터 (123차원).
+
+        블록:
+          Self(15)        : hp/mp/x/y + role(OH4) + radius + cd_skill + cd_role_a + cd_role_b
+                          + step_progress + aggro_ratio + is_top_aggro
+          Allies(24)      : 3명 × 8 = dx/dy(/10) + hp + alive + role(OH4)
+          Boss(10)        : dx/dy/dist(/10) + hp + phase(OH3) + grog + invuln + facing
+          PatternCh(45)   : 9패턴 × 5 = active + turns_norm + am_I_target + target_dx/dy(/10)
+          DangerSensor(8) : 8방향 거리 (1=안전)
+          Escape(4)       : in_danger + escape_dx + escape_dy + urgency
+          Coop(13)        : Chain(4) + Cross(3) + Stagger(2) + Seal(4)
+          Player(4)       : dx/dy/dist(/10) + hp
+        합계: 15+24+10+45+8+4+13+4 = 123
+        """
         u = self.units[uid]
-        w, h = self.config.map_width, self.config.map_height
-        v = []
+        cfg = self.config
+        v: List[float] = []
 
-        # 자기(8): hp비율, mp비율, x정규화, y정규화, 역할 one-hot(4)
-        v += [u.hp / max(1, u.max_hp), u.mp / max(1, u.max_mp),
-              u.x / w, u.y / h]
-        role_oh = [0, 0, 0, 0]
-        role_oh[int(u.role)] = 1
+        top_uid = self.boss.top_aggro_uid()
+
+        # ── [1] Self (15) ──
+        v += [
+            u.hp / max(1, u.max_hp),
+            u.mp / max(1, u.max_mp),
+            u.x / cfg.map_width,
+            u.y / cfg.map_height,
+        ]
+        role_oh = [0.0] * 4; role_oh[int(u.role)] = 1.0
         v += role_oh
+        v.append(u.radius)
+        cd_max = float(max(1, cfg.skill_cooldown))
+        v.append(u.cooldowns.get(int(BossActionID.ATTACK_SKILL), 0) / cd_max)
+        role_skills = {
+            PartyRole.DEALER:  (int(BossActionID.ATTACK_SKILL), int(BossActionID.ATTACK_SKILL)),
+            PartyRole.TANK:    (int(BossActionID.TAUNT), int(BossActionID.GUARD)),
+            PartyRole.HEALER:  (int(BossActionID.HEAL), int(BossActionID.CLEANSE)),
+            PartyRole.SUPPORT: (int(BossActionID.BUFF_ATK), int(BossActionID.BUFF_SHIELD)),
+        }
+        skill_a, skill_b = role_skills[u.role]
+        v.append(u.cooldowns.get(skill_a, 0) / cd_max)
+        v.append(u.cooldowns.get(skill_b, 0) / cd_max)
+        v.append(self.current_step / max(1, cfg.max_steps))
+        total_aggro = sum(self.boss.aggro.values()) + 1e-6
+        v.append(self.boss.aggro.get(uid, 0.0) / total_aggro)
+        v.append(1.0 if top_uid == uid else 0.0)
 
-        # 아군(24): 3명 × 8
-        others = [ux for ux in self.units.values() if ux.uid != uid]
+        # ── [2] Allies (24) — 자기 제외 3명, uid 오름차순 고정 슬롯 ──
+        allies = sorted((a for a in self.units.values() if a.uid != uid),
+                        key=lambda a: a.uid)
         for i in range(3):
-            if i < len(others):
-                a = others[i]
-                v += [a.hp / max(1, a.max_hp), a.mp / max(1, a.max_mp),
-                      a.x / w, a.y / h]
-                roh = [0, 0, 0, 0]; roh[int(a.role)] = 1
-                v += roh
+            if i < len(allies):
+                a = allies[i]
+                v += [
+                    (a.x - u.x) / 10.0,
+                    (a.y - u.y) / 10.0,
+                    a.hp / max(1, a.max_hp),
+                    1.0 if a.alive else 0.0,
+                ]
+                a_oh = [0.0] * 4; a_oh[int(a.role)] = 1.0
+                v += a_oh
             else:
                 v += [0.0] * 8
 
-        # 보스(10): hp비율, x, y, 페이즈(3), 어그로1위 one-hot(4)
-        v += [self.boss.hp / self.config.boss_max_hp,
-              self.boss.x / w, self.boss.y / h]
-        ph = [0, 0, 0]; ph[int(self.boss.phase)] = 1
-        v += ph
-        top = self.boss.top_aggro_uid() or 0
-        aoh = [0, 0, 0, 0]; aoh[top] = 1
-        v += aoh
+        # ── [3] Boss (10) ──
+        bdx = self.boss.x - u.x; bdy = self.boss.y - u.y
+        bdist = math.hypot(bdx, bdy)
+        v += [bdx / 10.0, bdy / 10.0, bdist / 10.0,
+              self.boss.hp / cfg.boss_max_hp]
+        ph_oh = [0.0] * 3; ph_oh[int(self.boss.phase)] = 1.0
+        v += ph_oh
+        v += [1.0 if self.boss.grog_turns > 0 else 0.0,
+              1.0 if self.boss.invuln_turns > 0 else 0.0]
+        facing = 0.0
+        if top_uid is not None and top_uid in self.units:
+            t = self.units[top_uid]
+            facing = math.atan2(t.y - self.boss.y, t.x - self.boss.x) / math.pi
+        v.append(facing)
 
-        # 어그로 비율(4)
-        total = sum(self.boss.aggro.values()) + 1e-6
-        v += [self.boss.aggro.get(i, 0) / total for i in range(4)]
+        # ── [4] Pattern channels (45) = 9 패턴 × 5 (패턴ID=인덱스 고정) ──
+        tg_by_pattern = {int(tg.pattern_id): tg for tg in self.boss.telegraphs}
+        for pid_int in range(9):
+            tg = tg_by_pattern.get(pid_int)
+            if tg is None:
+                v += [0.0, 0.0, 0.0, 0.0, 0.0]
+                continue
+            turns_norm = tg.turns_remaining / max(1, tg.total_wind_up)
+            am_I, tdx, tdy = self._pattern_target_info(tg, PatternID(pid_int), u, uid)
+            v += [1.0, turns_norm, am_I, tdx, tdy]
 
-        # 텔레그래프(24): 최대 2개 × (패턴 one-hot(8) + 남은턴 정규화(1) + 대상 one-hot(3))
-        for i in range(2):
-            if i < len(self.boss.telegraphs):
-                tg = self.boss.telegraphs[i]
-                poh = [0] * 8; poh[int(tg.pattern_id)] = 1
-                v += poh
-                v += [tg.turns_remaining / max(1, tg.total_wind_up)]
-                toh = [0, 0, 0]
-                # 대상 uid가 자기면 0, 다른 아군 중 첫번째면 1 등 축약
-                if tg.target_unit_ids and tg.target_unit_ids[0] == uid:
-                    toh[0] = 1
-                elif tg.target_unit_ids:
-                    toh[1] = 1
-                else:
-                    toh[2] = 1
-                v += toh
-            else:
-                v += [0.0] * 12
+        # ── [5] Danger sensor (8) ──
+        v += sample_danger_sensor((u.x, u.y), self.boss.telegraphs)
 
-        # 위험 타일 3x3 (9): 자기 위치 ±1
-        danger_tiles = set()
-        for tg in self.boss.telegraphs:
-            danger_tiles |= tg.danger_tiles
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                p = (u.x + dx, u.y + dy)
-                v += [1.0 if p in danger_tiles else 0.0]
+        # ── [6] Escape guide (4) ──
+        in_danger = 0.0
+        escape_dx, escape_dy, urgency = 0.0, 0.0, 0.0
+        danger_tgs = [tg for tg in self.boss.telegraphs
+                      if tg.pattern_id != PatternID.SEAL_BREAK
+                      and tg.contains((u.x, u.y))]
+        if danger_tgs:
+            in_danger = 1.0
+            urgent_tg = min(danger_tgs, key=lambda t: t.turns_remaining)
+            urgency = 1.0 - urgent_tg.turns_remaining / max(1, urgent_tg.total_wind_up)
+            best_step = 1e9
+            for di in range(8):
+                theta = di * math.pi / 4
+                for step_m in (0.5, 1.0, 1.5, 2.0, 3.0):
+                    tx = u.x + math.cos(theta) * step_m
+                    ty = u.y + math.sin(theta) * step_m
+                    if not urgent_tg.contains((tx, ty)):
+                        if step_m < best_step:
+                            best_step = step_m
+                            escape_dx = math.cos(theta)
+                            escape_dy = math.sin(theta)
+                        break
+        v += [in_danger, escape_dx, escape_dy, urgency]
 
-        # 스태거(2)
-        v += [self.boss.stagger_gauge / max(1, self.config.stagger_gauge),
-              1.0 if self.boss.stagger_active else 0.0]
-
-        # 저주 연결(3): 활성, 파트너 존재, 파트너 거리
-        chain_active = 1.0 if u.chained_with is not None else 0.0
-        partner_dist = 0.0
+        # ── [7] Coop context (13) ──
+        # Chain (4): wind_up/post-impact 통합
+        chain_partner_active = 0.0
+        chain_pdx, chain_pdy, chain_slack = 0.0, 0.0, 0.0
+        partner_uid = None
         if u.chained_with is not None and u.chained_with in self.units:
-            p = self.units[u.chained_with]
-            partner_dist = max(abs(u.x - p.x), abs(u.y - p.y)) / max(w, h)
-        v += [chain_active, 1.0 if chain_active > 0 else 0.0, partner_dist]
+            partner_uid = u.chained_with
+        else:
+            for tg in self.boss.telegraphs:
+                if tg.pattern_id == PatternID.CURSED_CHAIN and len(tg.target_unit_ids) >= 2:
+                    a, b = tg.target_unit_ids[:2]
+                    if uid == a:   partner_uid = b; break
+                    if uid == b:   partner_uid = a; break
+        if partner_uid is not None and partner_uid in self.units:
+            p = self.units[partner_uid]
+            chain_partner_active = 1.0
+            chain_pdx = (p.x - u.x) / 10.0
+            chain_pdy = (p.y - u.y) / 10.0
+            d = math.hypot(p.x - u.x, p.y - u.y)
+            chain_slack = max(0.0, cfg.pat_chain_max_distance - d) / cfg.pat_chain_max_distance
+        v += [chain_partner_active, chain_pdx, chain_pdy, chain_slack]
 
-        # 안전 지대 방향(4): 현재 P7 활성 시 2개 사분면 표시
-        safe_dir = [0.0, 0.0, 0.0, 0.0]
+        # Cross (3): 가장 가까운 안전 사분면 중심 상대 위치
+        cross_active = 0.0
+        safe_dx, safe_dy = 0.0, 0.0
+        cx_m = cfg.map_width / 2.0; cy_m = cfg.map_height / 2.0
+        quad_centers = {
+            0: (cx_m * 0.5,        cy_m * 0.5),
+            1: (cx_m * 1.5,        cy_m * 0.5),
+            2: (cx_m * 0.5,        cy_m * 1.5),
+            3: (cx_m * 1.5,        cy_m * 1.5),
+        }
         for tg in self.boss.telegraphs:
             if tg.pattern_id == PatternID.CROSS_INFERNO:
+                cross_active = 1.0
+                best_d = 1e9
                 for q in tg.target_unit_ids:
-                    safe_dir[q] = 1.0
+                    if 0 <= q < 4:
+                        qx, qy = quad_centers[q]
+                        d = math.hypot(qx - u.x, qy - u.y)
+                        if d < best_d:
+                            best_d = d
+                            safe_dx = (qx - u.x) / 10.0
+                            safe_dy = (qy - u.y) / 10.0
                 break
-        v += safe_dir
+        v += [cross_active, safe_dx, safe_dy]
 
-        # 플레이어 정보(4): 위치, HP, 거리
-        player = self.units[self.config.player_slot]
-        v += [player.x / w, player.y / h,
-              player.hp / max(1, player.max_hp),
-              (abs(u.x - player.x) + abs(u.y - player.y)) / (w + h)]
+        # Stagger (2)
+        v += [1.0 if self.boss.stagger_active else 0.0,
+              self.boss.stagger_gauge / max(1.0, cfg.stagger_gauge)]
+
+        # Seal (4)
+        seal_active = 0.0
+        my_spot_dx, my_spot_dy, seal_progress = 0.0, 0.0, 0.0
+        for tg in self.boss.telegraphs:
+            if tg.pattern_id == PatternID.SEAL_BREAK:
+                seal_active = 1.0
+                spots = tg.extra.get("npc_spots", {})
+                if uid in spots:
+                    si = spots[uid]
+                    if 0 <= si < len(tg.shapes):
+                        s = tg.shapes[si]
+                        my_spot_dx = (s.params["cx"] - u.x) / 10.0
+                        my_spot_dy = (s.params["cy"] - u.y) / 10.0
+                hold_prog = self._seal_hold_count / max(1, cfg.pat_seal_hold_turns)
+                wind_prog = 1.0 - tg.turns_remaining / max(1, tg.total_wind_up)
+                seal_progress = max(hold_prog, wind_prog)
+                break
+        v += [seal_active, my_spot_dx, my_spot_dy, seal_progress]
+
+        # ── [8] Player (4) ──
+        player = self.units[cfg.player_slot]
+        pdx = player.x - u.x; pdy = player.y - u.y
+        pdist = math.hypot(pdx, pdy)
+        v += [pdx / 10.0, pdy / 10.0, pdist / 10.0,
+              player.hp / max(1, player.max_hp)]
 
         arr = np.array(v, dtype=np.float32)
-        # 크기 맞추기 — 설계 92차원
-        expected = self.config.obs_size
+        expected = cfg.obs_size
         if arr.shape[0] < expected:
             arr = np.pad(arr, (0, expected - arr.shape[0]))
         elif arr.shape[0] > expected:
             arr = arr[:expected]
         return arr
+
+    def _pattern_target_info(self, tg: ActiveTelegraph, pid: PatternID,
+                             u: PartyUnit, uid: int) -> Tuple[float, float, float]:
+        """패턴별 primary target의 (am_I_target, dx/10, dy/10) 반환."""
+        am_I = 0.0
+        tdx, tdy = 0.0, 0.0
+
+        if pid in (PatternID.SLASH, PatternID.CHARGE,
+                   PatternID.MARK, PatternID.TAIL_SWIPE):
+            if tg.target_unit_ids:
+                tuid = tg.target_unit_ids[0]
+                am_I = 1.0 if tuid == uid else 0.0
+                if tuid in self.units:
+                    t = self.units[tuid]
+                    tdx = (t.x - u.x) / 10.0
+                    tdy = (t.y - u.y) / 10.0
+        elif pid == PatternID.CURSED_CHAIN:
+            if len(tg.target_unit_ids) >= 2:
+                a, b = tg.target_unit_ids[:2]
+                if uid == a or uid == b:
+                    am_I = 1.0
+                    partner = b if uid == a else a
+                else:
+                    partner = a
+                if partner in self.units:
+                    p = self.units[partner]
+                    tdx = (p.x - u.x) / 10.0
+                    tdy = (p.y - u.y) / 10.0
+        elif pid == PatternID.ERUPTION:
+            if tg.shapes:
+                best = min(tg.shapes,
+                           key=lambda s: math.hypot(s.params["cx"] - u.x,
+                                                    s.params["cy"] - u.y))
+                tdx = (best.params["cx"] - u.x) / 10.0
+                tdy = (best.params["cy"] - u.y) / 10.0
+        elif pid == PatternID.STAGGER:
+            tdx = (self.boss.x - u.x) / 10.0
+            tdy = (self.boss.y - u.y) / 10.0
+        elif pid == PatternID.CROSS_INFERNO:
+            cx_m = self.config.map_width / 2.0
+            cy_m = self.config.map_height / 2.0
+            quad_centers = {
+                0: (cx_m * 0.5, cy_m * 0.5), 1: (cx_m * 1.5, cy_m * 0.5),
+                2: (cx_m * 0.5, cy_m * 1.5), 3: (cx_m * 1.5, cy_m * 1.5),
+            }
+            best_d = 1e9
+            for q in tg.target_unit_ids:
+                if 0 <= q < 4:
+                    qx, qy = quad_centers[q]
+                    d = math.hypot(qx - u.x, qy - u.y)
+                    if d < best_d:
+                        best_d = d
+                        tdx = (qx - u.x) / 10.0
+                        tdy = (qy - u.y) / 10.0
+        elif pid == PatternID.SEAL_BREAK:
+            spots = tg.extra.get("npc_spots", {})
+            if uid in spots and uid != self.config.player_slot:
+                am_I = 1.0
+                si = spots[uid]
+                if 0 <= si < len(tg.shapes):
+                    s = tg.shapes[si]
+                    tdx = (s.params["cx"] - u.x) / 10.0
+                    tdy = (s.params["cy"] - u.y) / 10.0
+
+        return am_I, tdx, tdy
 
     # ────────────── info ──────────────
 
@@ -615,40 +958,50 @@ class BossRaidEnv:
     # ────────────── 스냅샷 (Unity 전송용) ──────────────
 
     def get_snapshot(self) -> dict:
-        """Unity 스트리머에서 JSON으로 직렬화해 보낼 게임 상태"""
         return {
             "step": self.current_step,
             "boss": {
-                "x": self.boss.x, "y": self.boss.y,
-                "hp": self.boss.hp, "max_hp": self.config.boss_max_hp,
+                "x": float(self.boss.x), "y": float(self.boss.y),
+                "hp": int(self.boss.hp), "max_hp": int(self.config.boss_max_hp),
                 "phase": int(self.boss.phase),
-                "invuln": self.boss.invuln_turns, "grog": self.boss.grog_turns,
-                "stagger_active": self.boss.stagger_active,
-                "stagger_gauge": self.boss.stagger_gauge,
+                "invuln": int(self.boss.invuln_turns), "grog": int(self.boss.grog_turns),
+                "stagger_active": bool(self.boss.stagger_active),
+                "stagger_gauge": float(self.boss.stagger_gauge),
+                "radius": float(self.config.boss_radius),
+                "vx": float(self.boss.x - self._prev_boss_pos[0]),
+                "vy": float(self.boss.y - self._prev_boss_pos[1]),
             },
             "units": [
                 {
-                    "uid": u.uid, "role": int(u.role),
-                    "x": u.x, "y": u.y,
-                    "hp": u.hp, "max_hp": u.max_hp,
-                    "alive": u.alive,
-                    "marked": u.marked_turns > 0,
-                    "chained_with": u.chained_with,
-                    "buff_atk": u.buff_atk, "buff_shield": u.buff_shield,
+                    "uid": int(u.uid), "role": int(u.role),
+                    "x": float(u.x), "y": float(u.y),
+                    "hp": int(u.hp), "max_hp": int(u.max_hp),
+                    "alive": bool(u.alive),
+                    "marked": bool(u.marked_turns > 0),
+                    "chained_with": int(u.chained_with) if u.chained_with is not None else -1,
+                    "buff_atk": int(u.buff_atk), "buff_shield": int(u.buff_shield),
+                    "radius": float(u.radius),
+                    "vx": float(u.x - self._prev_unit_positions.get(u.uid, (u.x, u.y))[0]),
+                    "vy": float(u.y - self._prev_unit_positions.get(u.uid, (u.x, u.y))[1]),
                 }
                 for u in self.units.values()
             ],
             "telegraphs": [
                 {
                     "pattern": int(tg.pattern_id),
-                    "turns_remaining": tg.turns_remaining,
-                    "total_wind_up": tg.total_wind_up,
-                    "danger_tiles": list(tg.danger_tiles),
-                    "target_uids": list(tg.target_unit_ids),
+                    "turns_remaining": int(tg.turns_remaining),
+                    "total_wind_up": int(tg.total_wind_up),
+                    "shapes": [s.to_dict() for s in tg.shapes],
+                    "target_uids": [int(x) for x in tg.target_unit_ids],
                 }
                 for tg in self.boss.telegraphs
             ],
-            "done": self.done,
-            "victory": self.victory,
-            "wipe": self.wipe,
+            "events": [
+                {"uid": uid, **event}
+                for uid, event_list in self.step_events.items()
+                for event in event_list
+            ],
+            "done": bool(self.done),
+            "victory": bool(self.victory),
+            "wipe": bool(self.wipe),
         }

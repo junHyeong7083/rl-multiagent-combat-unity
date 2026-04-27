@@ -14,10 +14,13 @@ from .patterns import PATTERN_REGISTRY, BasePattern, ActiveTelegraph
 from .env import BossRaidEnv
 from .fsm_npc import FSMNpcPolicy
 from .rewards import RewardComputer
+from .bt_policy import BTPolicy
+from .hybrid_policy import HybridPolicy
 
 __all__ = [
     "BossConfig", "PartyRole", "PatternID", "PhaseID", "BossActionID",
     "ROLE_STATS_BOSS",
     "Boss", "BossRaidEnv", "FSMNpcPolicy", "RewardComputer",
     "BasePattern", "ActiveTelegraph", "PATTERN_REGISTRY",
+    "BTPolicy", "HybridPolicy",
 ]

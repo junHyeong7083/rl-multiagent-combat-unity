@@ -25,8 +25,29 @@ namespace BossRaid
                 boss = ParseBoss(GetDict(d, "boss")),
                 units = ParseUnits(GetList(d, "units")),
                 telegraphs = ParseTelegraphs(GetList(d, "telegraphs")),
+                events = ParseEvents(GetList(d, "events")),
             };
             return snap;
+        }
+
+        private static EventData[] ParseEvents(List<object> list)
+        {
+            if (list == null) return new EventData[0];
+            var arr = new EventData[list.Count];
+            for (int i = 0; i < list.Count; i++)
+            {
+                var d = list[i] as Dictionary<string, object>;
+                arr[i] = new EventData
+                {
+                    uid = GetIntOrDefault(d, "uid", -1),
+                    type = GetString(d, "type"),
+                    amount = GetInt(d, "amount"),
+                    target = GetIntOrDefault(d, "target", -1),
+                    skill = GetBool(d, "skill"),
+                    kind = GetString(d, "kind"),
+                };
+            }
+            return arr;
         }
 
         private static BossData ParseBoss(Dictionary<string, object> d)
@@ -34,8 +55,10 @@ namespace BossRaid
             if (d == null) return null;
             return new BossData
             {
-                x = GetInt(d, "x"),
-                y = GetInt(d, "y"),
+                x = GetFloat(d, "x"),
+                y = GetFloat(d, "y"),
+                vx = GetFloat(d, "vx"),
+                vy = GetFloat(d, "vy"),
                 hp = GetInt(d, "hp"),
                 max_hp = GetInt(d, "max_hp"),
                 phase = GetInt(d, "phase"),
@@ -43,6 +66,7 @@ namespace BossRaid
                 grog = GetInt(d, "grog"),
                 stagger_active = GetBool(d, "stagger_active"),
                 stagger_gauge = GetFloat(d, "stagger_gauge"),
+                radius = GetFloat(d, "radius"),
             };
         }
 
@@ -57,8 +81,10 @@ namespace BossRaid
                 {
                     uid = GetInt(d, "uid"),
                     role = GetInt(d, "role"),
-                    x = GetInt(d, "x"),
-                    y = GetInt(d, "y"),
+                    x = GetFloat(d, "x"),
+                    y = GetFloat(d, "y"),
+                    vx = GetFloat(d, "vx"),
+                    vy = GetFloat(d, "vy"),
                     hp = GetInt(d, "hp"),
                     max_hp = GetInt(d, "max_hp"),
                     alive = GetBool(d, "alive"),
@@ -66,6 +92,7 @@ namespace BossRaid
                     chained_with = GetIntOrDefault(d, "chained_with", -1),
                     buff_atk = GetInt(d, "buff_atk"),
                     buff_shield = GetInt(d, "buff_shield"),
+                    radius = GetFloat(d, "radius"),
                 };
             }
             return arr;
@@ -78,15 +105,11 @@ namespace BossRaid
             for (int i = 0; i < list.Count; i++)
             {
                 var d = list[i] as Dictionary<string, object>;
-                var tilesRaw = GetList(d, "danger_tiles");
-                int[][] tiles = new int[tilesRaw?.Count ?? 0][];
-                for (int t = 0; t < tiles.Length; t++)
+                var shapesRaw = GetList(d, "shapes");
+                ShapeData[] shapes = new ShapeData[shapesRaw?.Count ?? 0];
+                for (int s = 0; s < shapes.Length; s++)
                 {
-                    var tileList = tilesRaw[t] as List<object>;
-                    tiles[t] = new int[] {
-                        (int)(long)tileList[0],
-                        (int)(long)tileList[1]
-                    };
+                    shapes[s] = ParseShape(shapesRaw[s] as Dictionary<string, object>);
                 }
                 var targetsRaw = GetList(d, "target_uids");
                 int[] targets = new int[targetsRaw?.Count ?? 0];
@@ -98,12 +121,35 @@ namespace BossRaid
                     pattern = GetInt(d, "pattern"),
                     turns_remaining = GetInt(d, "turns_remaining"),
                     total_wind_up = GetInt(d, "total_wind_up"),
-                    danger_tiles = tiles,
+                    shapes = shapes,
                     target_uids = targets,
                 };
             }
             return arr;
         }
+
+        private static ShapeData ParseShape(Dictionary<string, object> d)
+        {
+            if (d == null) return new ShapeData();
+            return new ShapeData
+            {
+                kind = GetString(d, "kind"),
+                cx = GetFloat(d, "cx"),
+                cy = GetFloat(d, "cy"),
+                r = GetFloat(d, "r"),
+                angle = GetFloat(d, "angle"),
+                width = GetFloat(d, "width"),
+                ax = GetFloat(d, "ax"),
+                ay = GetFloat(d, "ay"),
+                bx = GetFloat(d, "bx"),
+                by = GetFloat(d, "by"),
+                hw = GetFloat(d, "hw"),
+                safe_mask = GetFloat(d, "safe_mask"),
+            };
+        }
+
+        private static string GetString(Dictionary<string, object> d, string k)
+            => d != null && d.TryGetValue(k, out var v) && v is string s ? s : null;
 
         // ── Helpers ──
         private static int GetInt(Dictionary<string, object> d, string k)
